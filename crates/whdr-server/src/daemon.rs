@@ -31,12 +31,12 @@ use tokio::time;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use whdr_proto::{
-    ClosingReason, ControlRequest, ControlResponse, Event, ExtMsg, HttpReply, PROTOCOL_VERSION,
-    Pattern, SrvMsg, SubClientMsg, SubServerMsg, decode_line, encode_line, validate_channel,
-    validate_pattern,
+    ClosingReason, ControlRequest, ControlResponse, Event, ExtMsg, HttpReply, Pattern, SrvMsg,
+    SubClientMsg, SubServerMsg, decode_line, encode_line, validate_channel, validate_pattern,
 };
 
 use crate::dispatch_window::{DispatchWait, DispatchWindow};
+use crate::extension_registration::read_registration;
 use crate::{Config, TokenStore};
 
 const INITIAL_RESPAWN_BACKOFF_MS: u64 = 250;
@@ -270,38 +270,17 @@ impl AppState {
         }
 
         let mut lines = BufReader::new(stdout).lines();
-        let register = async {
-            let first_line = time::timeout(
-                Duration::from_millis(config.timeouts.register_ms),
-                lines.next_line(),
-            )
-            .await
-            .context("extension register timeout")??
-            .context("extension exited before register")?;
-            match decode_line::<ExtMsg>(&first_line)? {
-                Some(ExtMsg::Register {
-                    protocol,
-                    id,
-                    paths,
-                    channels,
-                    meta: _,
-                }) => {
-                    if protocol != PROTOCOL_VERSION {
-                        bail!("unsupported protocol version {protocol}");
-                    }
-                    Ok((id.unwrap_or_else(|| candidate_id.clone()), paths, channels))
+        let registration =
+            match read_registration(&candidate_id, &mut lines, config.timeouts.register_ms).await {
+                Ok(registration) => registration,
+                Err(err) => {
+                    kill_child_wait(&mut child, &candidate_id, "register failed").await;
+                    return Err(err);
                 }
-                Some(other) => bail!("expected register, got {other:?}"),
-                None => bail!("blank register line"),
-            }
-        };
-        let (id, aliases, channels) = match register.await {
-            Ok(register) => register,
-            Err(err) => {
-                kill_child_wait(&mut child, &candidate_id, "register failed").await;
-                return Err(err);
-            }
-        };
+            };
+        let id = registration.id;
+        let aliases = registration.paths;
+        let channels = registration.channels;
 
         let mut claims = vec![id.clone()];
         claims.extend(aliases);
