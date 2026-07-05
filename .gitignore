@@ -1,0 +1,4 @@
+/target/
+/.worktrees/
+*.log
+*.tmp

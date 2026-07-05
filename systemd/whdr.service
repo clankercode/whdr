@@ -1,0 +1,14 @@
+[Unit]
+Description=Webhook Dynamic Router
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/whdr-server --config /etc/whdr/config.toml
+Restart=on-failure
+User=whdr
+Group=whdr
+RuntimeDirectory=whdr
+StateDirectory=whdr
+
+[Install]
+WantedBy=multi-user.target

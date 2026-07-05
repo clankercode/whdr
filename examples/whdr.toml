@@ -1,0 +1,27 @@
+[server]
+listen_addr = "127.0.0.1:8787"
+sub_addr = "127.0.0.1:8788"
+control_socket = "/tmp/whdr/ctl.sock"
+
+[subscribers]
+token_store = "/tmp/whdr/tokens.toml"
+allow_plaintext_lan = false
+ws_idle_timeout_ms = 30000
+
+[extensions]
+enabled = ["dev"]
+autostart_all = false
+
+[limits]
+max_body_bytes = 1048576
+max_in_flight = 64
+sub_queue_len = 1024
+dispatch_timeout_ms = 10000
+
+[timeouts]
+register_ms = 5000
+drain_ms = 5000
+term_grace_ms = 3000
+
+[secrets]
+file = "/tmp/whdr-secrets.toml"

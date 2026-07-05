@@ -1,0 +1,18 @@
+[package]
+name = "whdr-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+whdr-server = { path = "../whdr-server" }
+whdr-proto = { path = "../whdr-proto" }
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[[bin]]
+name = "whdr"
+path = "src/main.rs"

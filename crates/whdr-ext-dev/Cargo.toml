@@ -1,0 +1,20 @@
+[package]
+name = "whdr-ext-dev"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+whdr-ext-kit = { path = "../whdr-ext-kit" }
+whdr-proto = { path = "../whdr-proto" }
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[[bin]]
+name = "whdr-ext-dev"
+path = "src/main.rs"

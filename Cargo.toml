@@ -1,0 +1,54 @@
+[workspace]
+members = [
+    "crates/whdr-proto",
+    "crates/whdr-server",
+    "crates/whdr-cli",
+    "crates/whdr-ext-kit",
+    "crates/whdr-ext-dev",
+    "crates/whdr-test-support",
+    "exts/whdr-ext-github",
+    "exts/whdr-ext-teams",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Unlicense OR CC0-1.0"
+rust-version = "1.93"
+
+[workspace.dependencies]
+anyhow = "1"
+arc-swap = "1"
+assert_cmd = "2"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+hex = "0.4"
+hmac = "0.12"
+http = "1"
+hyper = "1"
+libc = "0.2"
+proptest = "1"
+rand = "0.9"
+rustls = "0.23"
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+smallvec = { version = "1", features = ["serde"] }
+subtle = "2"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
+toml = "0.9"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["serde", "v4"] }
