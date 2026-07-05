@@ -6,8 +6,8 @@ use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -36,6 +36,7 @@ use whdr_proto::{
     validate_pattern,
 };
 
+use crate::dispatch_window::{DispatchWait, DispatchWindow};
 use crate::{Config, TokenStore};
 
 const INITIAL_RESPAWN_BACKOFF_MS: u64 = 250;
@@ -71,83 +72,12 @@ struct ExtHandle {
     channels: Vec<String>,
     tx: mpsc::Sender<SrvMsg>,
     supervisor_tx: mpsc::Sender<SupervisorCommand>,
-    pending: Arc<StdMutex<HashMap<Uuid, PendingDispatch>>>,
-    in_flight: Arc<AtomicUsize>,
+    dispatches: DispatchWindow<ExtResult>,
     protocol_errors: Arc<AtomicUsize>,
     namespace_violations: Arc<AtomicUsize>,
     consecutive_timeouts: Arc<AtomicUsize>,
     restarts: Arc<AtomicUsize>,
     pid: Option<u32>,
-}
-
-struct PendingDispatch {
-    tx: oneshot::Sender<ExtResult>,
-    permit: InFlightPermit,
-}
-
-struct InFlightPermit {
-    counter: Arc<AtomicUsize>,
-}
-
-impl InFlightPermit {
-    fn new(counter: Arc<AtomicUsize>) -> Self {
-        Self { counter }
-    }
-}
-
-impl Drop for InFlightPermit {
-    fn drop(&mut self) {
-        release_in_flight(&self.counter);
-    }
-}
-
-struct PendingDispatchCleanup {
-    pending: Arc<StdMutex<HashMap<Uuid, PendingDispatch>>>,
-    req_id: Uuid,
-    armed: bool,
-}
-
-impl PendingDispatchCleanup {
-    fn new(pending: Arc<StdMutex<HashMap<Uuid, PendingDispatch>>>, req_id: Uuid) -> Self {
-        Self {
-            pending,
-            req_id,
-            armed: false,
-        }
-    }
-
-    fn arm(&mut self) {
-        self.armed = true;
-    }
-
-    fn remove_pending(&mut self) -> bool {
-        if !self.armed {
-            return false;
-        }
-        let removed = lock_pending(&self.pending).remove(&self.req_id).is_some();
-        self.armed = false;
-        removed
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for PendingDispatchCleanup {
-    fn drop(&mut self) {
-        if self.armed {
-            lock_pending(&self.pending).remove(&self.req_id);
-        }
-    }
-}
-
-fn lock_pending(
-    pending: &StdMutex<HashMap<Uuid, PendingDispatch>>,
-) -> std::sync::MutexGuard<'_, HashMap<Uuid, PendingDispatch>> {
-    pending
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(not(test))]
@@ -378,9 +308,7 @@ impl AppState {
 
         let (tx, mut rx) = mpsc::channel::<SrvMsg>(config.limits.max_in_flight.max(1) * 2);
         let (supervisor_tx, supervisor_rx) = mpsc::channel::<SupervisorCommand>(4);
-        let pending: Arc<StdMutex<HashMap<Uuid, PendingDispatch>>> =
-            Arc::new(StdMutex::new(HashMap::new()));
-        let in_flight = Arc::new(AtomicUsize::new(0));
+        let dispatches = DispatchWindow::new();
         let protocol_errors = Arc::new(AtomicUsize::new(0));
         let namespace_violations = Arc::new(AtomicUsize::new(0));
         let consecutive_timeouts = Arc::new(AtomicUsize::new(0));
@@ -396,8 +324,7 @@ impl AppState {
             channels: channels.clone(),
             tx: tx.clone(),
             supervisor_tx: supervisor_tx.clone(),
-            pending: pending.clone(),
-            in_flight: in_flight.clone(),
+            dispatches: dispatches.clone(),
             protocol_errors: protocol_errors.clone(),
             namespace_violations: namespace_violations.clone(),
             consecutive_timeouts: consecutive_timeouts.clone(),
@@ -470,7 +397,7 @@ impl AppState {
         });
 
         let reader_state = self.clone();
-        let reader_pending = pending.clone();
+        let reader_dispatches = dispatches.clone();
         let reader_protocol_errors = protocol_errors.clone();
         let reader_timeouts = consecutive_timeouts.clone();
         let reader_namespace_violations = namespace_violations.clone();
@@ -493,9 +420,7 @@ impl AppState {
                         http,
                         mut events,
                     })) => {
-                        if let Some(pending) = lock_pending(&reader_pending).remove(&req_id) {
-                            let PendingDispatch { tx, permit } = pending;
-                            drop(permit);
+                        if let Some(tx) = reader_dispatches.remove(&req_id) {
                             reader_timeouts.store(0, Ordering::Relaxed);
                             events = filter_owned_events(
                                 &reader_id,
@@ -719,7 +644,7 @@ impl AppState {
         let handle = removed?;
 
         self.unroute_extension(&handle).await;
-        lock_pending(&handle.pending).clear();
+        handle.dispatches.clear();
         {
             let mut unavailable = self.inner.unavailable_routes.write().await;
             if mark_unavailable {
@@ -776,8 +701,7 @@ impl AppState {
                 let Some(handle) = self.extension_handle(id, generation).await else {
                     return true;
                 };
-                let pending_empty = lock_pending(&handle.pending).is_empty();
-                if pending_empty && handle.in_flight.load(Ordering::Relaxed) == 0 {
+                if handle.dispatches.is_idle() {
                     return true;
                 }
                 time::sleep(Duration::from_millis(5)).await;
@@ -865,7 +789,7 @@ impl AppState {
                 "restarts": handle.restarts.load(Ordering::Relaxed),
                 "paths": handle.paths,
                 "channels": handle.channels,
-                "in_flight": handle.in_flight.load(Ordering::Relaxed),
+                "in_flight": handle.dispatches.in_flight(),
                 "protocol_errors": handle.protocol_errors.load(Ordering::Relaxed),
                 "namespace_violations": handle.namespace_violations.load(Ordering::Relaxed),
                 "consecutive_timeouts": handle.consecutive_timeouts.load(Ordering::Relaxed),
@@ -915,18 +839,12 @@ impl ExtHandle {
         body: Bytes,
     ) -> Result<ExtResult, DispatchError> {
         let config = state.inner.config.read().await.clone();
-        if !reserve_in_flight(&self.in_flight, config.limits.max_in_flight) {
+        let Some(mut reservation) = self.dispatches.reserve(config.limits.max_in_flight) else {
             return Err(DispatchError::Busy);
-        }
-        let permit = InFlightPermit::new(self.in_flight.clone());
-        let req_id = Uuid::new_v4();
-        let (tx, rx) = oneshot::channel();
-        let mut pending_cleanup = PendingDispatchCleanup::new(self.pending.clone(), req_id);
-        lock_pending(&self.pending).insert(req_id, PendingDispatch { tx, permit });
-        pending_cleanup.arm();
+        };
         let secret = config.secrets.get(&self.id).cloned();
         let msg = SrvMsg::Dispatch {
-            req_id,
+            req_id: reservation.req_id(),
             method: method.to_string(),
             path,
             query,
@@ -935,12 +853,14 @@ impl ExtHandle {
             secret,
         };
         if self.tx.send(msg).await.is_err() {
-            pending_cleanup.remove_pending();
+            reservation.remove_pending();
             return Err(DispatchError::Dead);
         }
-        match time::timeout(Duration::from_millis(config.limits.dispatch_timeout_ms), rx).await {
-            Ok(Ok(mut result)) => {
-                pending_cleanup.disarm();
+        match reservation
+            .wait(Duration::from_millis(config.limits.dispatch_timeout_ms))
+            .await
+        {
+            DispatchWait::Result(mut result) => {
                 result.events = filter_owned_events(
                     &self.id,
                     &self.paths,
@@ -951,12 +871,8 @@ impl ExtHandle {
                 state.fanout(result.events.clone()).await;
                 Ok(result)
             }
-            Ok(Err(_)) => {
-                pending_cleanup.disarm();
-                Err(DispatchError::Dead)
-            }
-            Err(_) => {
-                pending_cleanup.remove_pending();
+            DispatchWait::Dead => Err(DispatchError::Dead),
+            DispatchWait::Timeout => {
                 let timeouts = self.consecutive_timeouts.fetch_add(1, Ordering::Relaxed) + 1;
                 let threshold = config.limits.hang_kill_threshold.max(1);
                 if timeouts == threshold {
@@ -1779,32 +1695,6 @@ fn channel_prefixes_overlap(left: &str, right: &str) -> bool {
     channel_is_in_prefix(left, right) || channel_is_in_prefix(right, left)
 }
 
-fn reserve_in_flight(counter: &AtomicUsize, max: usize) -> bool {
-    let mut current = counter.load(Ordering::Relaxed);
-    loop {
-        if current >= max {
-            return false;
-        }
-        match counter.compare_exchange_weak(
-            current,
-            current + 1,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => return true,
-            Err(observed) => current = observed,
-        }
-    }
-}
-
-fn release_in_flight(counter: &AtomicUsize) {
-    counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-            Some(v.saturating_sub(1))
-        })
-        .ok();
-}
-
 fn discover_extensions() -> Result<Vec<(String, PathBuf)>> {
     let mut found = HashMap::new();
     let Some(path_var) = env::var_os("PATH") else {
@@ -1944,7 +1834,7 @@ done
             let pending = {
                 let extensions = state.inner.extensions.read().await;
                 let handle = extensions.get("drain").unwrap();
-                lock_pending(&handle.pending).len()
+                handle.dispatches.pending_len()
             };
             if pending == 1 {
                 break;
@@ -1962,8 +1852,8 @@ done
                 .cloned()
                 .expect("draining extension should remain active")
         };
-        assert_eq!(lock_pending(&handle.pending).len(), 1);
-        assert_eq!(handle.in_flight.load(Ordering::Relaxed), 1);
+        assert_eq!(handle.dispatches.pending_len(), 1);
+        assert_eq!(handle.dispatches.in_flight(), 1);
         assert!(!state.inner.routes.read().await.contains_key("drain"));
 
         time::sleep(Duration::from_millis(25)).await;
@@ -2042,7 +1932,7 @@ done
 
         assert_eq!(timed_out, 1, "only one dispatch should reserve capacity");
         assert_eq!(busy, DISPATCHES - 1);
-        assert_eq!(handle.in_flight.load(Ordering::Relaxed), 0);
+        assert_eq!(handle.dispatches.in_flight(), 0);
 
         shutdown_test_extensions(&state).await;
     }
@@ -2090,8 +1980,8 @@ done
 
         let pending_deadline = Instant::now() + Duration::from_millis(100);
         loop {
-            let pending = lock_pending(&handle.pending).len();
-            if pending == 1 && handle.in_flight.load(Ordering::Relaxed) == 1 {
+            let pending = handle.dispatches.pending_len();
+            if pending == 1 && handle.dispatches.in_flight() == 1 {
                 break;
             }
             assert!(
@@ -2121,8 +2011,8 @@ done
             matches!(second, Err(DispatchError::Timeout)),
             "capacity leaked after cancellation"
         );
-        assert_eq!(lock_pending(&handle.pending).len(), 0);
-        assert_eq!(handle.in_flight.load(Ordering::Relaxed), 0);
+        assert_eq!(handle.dispatches.pending_len(), 0);
+        assert_eq!(handle.dispatches.in_flight(), 0);
 
         shutdown_test_extensions(&state).await;
     }
@@ -2196,8 +2086,8 @@ done
 
         let pending_deadline = Instant::now() + Duration::from_millis(250);
         loop {
-            let pending = lock_pending(&handle.pending).len();
-            if pending == 1 && handle.in_flight.load(Ordering::Relaxed) == 1 {
+            let pending = handle.dispatches.pending_len();
+            if pending == 1 && handle.dispatches.in_flight() == 1 {
                 break;
             }
             assert!(

@@ -1,5 +1,6 @@
 mod config;
 mod daemon;
+mod dispatch_window;
 mod token_store;
 
 pub use config::{
