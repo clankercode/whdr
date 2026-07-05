@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -30,8 +30,8 @@ use tokio::time;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use whdr_proto::{
-    ClosingReason, ControlRequest, ControlResponse, Event, ExtMsg, HttpReply, Pattern, SrvMsg,
-    SubClientMsg, SubServerMsg, decode_line, encode_line, validate_channel, validate_pattern,
+    ClosingReason, ControlRequest, ControlResponse, Event, ExtMsg, HttpReply, SrvMsg, SubClientMsg,
+    SubServerMsg, decode_line, encode_line, validate_channel,
 };
 
 use crate::dispatch_window::{DispatchWait, DispatchWindow};
@@ -39,6 +39,7 @@ use crate::extension_process::{
     ExtensionProcess, kill_child_wait, spawn_extension_process, wait_for_child_shutdown,
 };
 use crate::extension_registration::read_registration;
+use crate::subscribers::{SubscriberRegistration, SubscriberRegistry};
 use crate::{Config, TokenStore};
 
 const INITIAL_RESPAWN_BACKOFF_MS: u64 = 250;
@@ -57,9 +58,8 @@ struct Inner {
     channel_prefixes: RwLock<HashMap<String, String>>,
     extensions: RwLock<HashMap<String, ExtHandle>>,
     failed_extensions: RwLock<HashMap<String, String>>,
-    subscribers: RwLock<HashMap<u64, Subscriber>>,
+    subscribers: SubscriberRegistry,
     supervisor: AsyncMutex<HashMap<String, SupervisorState>>,
-    next_subscriber_id: AtomicU64,
     shutting_down: AtomicBool,
     started: Instant,
 }
@@ -85,16 +85,6 @@ struct ExtHandle {
 struct ExtResult {
     http: HttpReply,
     events: Vec<Event>,
-}
-
-struct Subscriber {
-    name: String,
-    remote_addr: Option<String>,
-    patterns: Vec<Pattern>,
-    tx: mpsc::Sender<SubServerMsg>,
-    close_tx: watch::Sender<Option<ClosingReason>>,
-    delivered: usize,
-    dropped: usize,
 }
 
 #[derive(Debug)]
@@ -143,9 +133,8 @@ impl AppState {
                 channel_prefixes: RwLock::new(HashMap::new()),
                 extensions: RwLock::new(HashMap::new()),
                 failed_extensions: RwLock::new(HashMap::new()),
-                subscribers: RwLock::new(HashMap::new()),
+                subscribers: SubscriberRegistry::new(),
                 supervisor: AsyncMutex::new(HashMap::new()),
-                next_subscriber_id: AtomicU64::new(1),
                 shutting_down: AtomicBool::new(false),
                 started: Instant::now(),
             }),
@@ -385,39 +374,11 @@ impl AppState {
     }
 
     async fn fanout(&self, events: Vec<Event>) {
-        if events.is_empty() {
-            return;
-        }
-        let mut subscribers = self.inner.subscribers.write().await;
-        for event in events {
-            for subscriber in subscribers.values_mut() {
-                let matches = subscriber
-                    .patterns
-                    .iter()
-                    .any(|pattern| pattern.matches(&event.channel).unwrap_or(false));
-                if !matches {
-                    continue;
-                }
-                let msg = SubServerMsg::Event {
-                    channel: event.channel.clone(),
-                    payload_b64: event.payload_b64.clone(),
-                };
-                match subscriber.tx.try_send(msg) {
-                    Ok(()) => subscriber.delivered += 1,
-                    Err(mpsc::error::TrySendError::Full(_)) => subscriber.dropped += 1,
-                    Err(mpsc::error::TrySendError::Closed(_)) => {}
-                }
-            }
-        }
+        self.inner.subscribers.fanout(events).await;
     }
 
     async fn close_subscribers_named(&self, name: &str, reason: ClosingReason) {
-        let subscribers = self.inner.subscribers.read().await;
-        for subscriber in subscribers.values() {
-            if subscriber.name == name {
-                let _ = subscriber.close_tx.send(Some(reason.clone()));
-            }
-        }
+        self.inner.subscribers.close_named(name, reason).await;
     }
 
     async fn stop_removed_extensions(&self, desired: &HashMap<String, PathBuf>) {
@@ -622,7 +583,6 @@ impl AppState {
     async fn status_json(&self) -> Value {
         let extensions = self.inner.extensions.read().await;
         let failed = self.inner.failed_extensions.read().await;
-        let subscribers = self.inner.subscribers.read().await;
         let mut ext_rows = Vec::new();
         for handle in extensions.values() {
             ext_rows.push(json!({
@@ -647,18 +607,23 @@ impl AppState {
                 "reason": reason,
             }));
         }
-        let sub_rows: Vec<Value> = subscribers
-            .values()
+        let sub_rows: Vec<Value> = self
+            .inner
+            .subscribers
+            .snapshots()
+            .await
+            .into_iter()
             .map(|subscriber| {
                 json!({
                     "name": subscriber.name,
                     "remote_addr": subscriber.remote_addr,
-                    "patterns": subscriber.patterns.iter().map(|p| p.as_str().to_string()).collect::<Vec<_>>(),
+                    "patterns": subscriber.patterns,
                     "delivered": subscriber.delivered,
                     "dropped": subscriber.dropped,
                 })
             })
             .collect();
+        let subscriber_count = sub_rows.len();
         json!({
             "uptime_ms": self.inner.started.elapsed().as_millis(),
             "extensions": ext_rows,
@@ -667,7 +632,7 @@ impl AppState {
                 "routes": self.inner.routes.read().await.len(),
                 "unavailable_routes": self.inner.unavailable_routes.read().await.len(),
                 "channel_prefixes": self.inner.channel_prefixes.read().await.len(),
-                "subscriber_count": subscribers.len(),
+                "subscriber_count": subscriber_count,
             }
         })
     }
@@ -1172,27 +1137,21 @@ async fn subscribe_handler(
 }
 
 async fn subscriber_socket(state: AppState, name: String, socket: WebSocket) {
-    let id = state
-        .inner
-        .next_subscriber_id
-        .fetch_add(1, Ordering::Relaxed);
     let config = state.inner.config.read().await.clone();
     let queue_len = config.limits.sub_queue_len.max(1);
     let ws_idle_timeout = Duration::from_millis(config.subscribers.ws_idle_timeout_ms.max(1));
     let (tx, mut rx) = mpsc::channel::<SubServerMsg>(queue_len);
     let (close_tx, mut close_rx) = watch::channel::<Option<ClosingReason>>(None);
-    state.inner.subscribers.write().await.insert(
-        id,
-        Subscriber {
+    let id = state
+        .inner
+        .subscribers
+        .insert(SubscriberRegistration {
             name: name.clone(),
             remote_addr: None,
-            patterns: Vec::new(),
             tx: tx.clone(),
             close_tx,
-            delivered: 0,
-            dropped: 0,
-        },
-    );
+        })
+        .await;
 
     let (mut sink, mut stream) = socket.split();
     let _ = sink
@@ -1266,7 +1225,7 @@ async fn subscriber_socket(state: AppState, name: String, socket: WebSocket) {
         }
     }
 
-    state.inner.subscribers.write().await.remove(&id);
+    state.inner.subscribers.remove(id).await;
 }
 
 async fn handle_subscriber_text(
@@ -1278,25 +1237,14 @@ async fn handle_subscriber_text(
     let msg: SubClientMsg = serde_json::from_str(text)?;
     match msg {
         SubClientMsg::Subscribe { patterns } => {
-            let mut parsed = Vec::new();
-            for pattern in patterns {
-                if let Err(err) = validate_pattern(&pattern) {
-                    let _ = tx
-                        .send(SubServerMsg::Error {
-                            op: "subscribe".to_string(),
-                            msg: format!("invalid pattern: {err}"),
-                        })
-                        .await;
-                    return Ok(());
-                }
-                parsed.push(Pattern::new(pattern)?);
-            }
-            if let Some(subscriber) = state.inner.subscribers.write().await.get_mut(&id) {
-                for pattern in parsed {
-                    if !subscriber.patterns.iter().any(|p| p == &pattern) {
-                        subscriber.patterns.push(pattern);
-                    }
-                }
+            if let Err(msg) = state.inner.subscribers.subscribe(id, patterns).await {
+                let _ = tx
+                    .send(SubServerMsg::Error {
+                        op: "subscribe".to_string(),
+                        msg,
+                    })
+                    .await;
+                return Ok(());
             }
             let _ = tx
                 .send(SubServerMsg::Ok {
@@ -1305,11 +1253,7 @@ async fn handle_subscriber_text(
                 .await;
         }
         SubClientMsg::Unsubscribe { patterns } => {
-            if let Some(subscriber) = state.inner.subscribers.write().await.get_mut(&id) {
-                subscriber
-                    .patterns
-                    .retain(|pattern| !patterns.iter().any(|p| p == pattern.as_str()));
-            }
+            state.inner.subscribers.unsubscribe(id, &patterns).await;
             let _ = tx
                 .send(SubServerMsg::Ok {
                     op: "unsubscribe".to_string(),
@@ -1407,8 +1351,7 @@ async fn handle_control_request(state: &AppState, request: ControlRequest) -> Co
             }
         }
         ControlRequest::TokenList => {
-            let subscribers = state.inner.subscribers.read().await;
-            let active = active_connection_counts(&subscribers);
+            let active = state.inner.subscribers.active_connection_counts().await;
             ControlResponse::Tokens {
                 tokens: state.inner.token_store.read().await.list(&active),
             }
@@ -1417,10 +1360,11 @@ async fn handle_control_request(state: &AppState, request: ControlRequest) -> Co
 }
 
 async fn send_shutdown_to_subscribers(state: &AppState) {
-    let subscribers = state.inner.subscribers.read().await;
-    for subscriber in subscribers.values() {
-        let _ = subscriber.close_tx.send(Some(ClosingReason::Shutdown));
-    }
+    state
+        .inner
+        .subscribers
+        .close_all(ClosingReason::Shutdown)
+        .await;
 }
 
 async fn send_shutdown_to_extensions(state: &AppState) {
@@ -1484,14 +1428,6 @@ fn http_reply_to_response(reply: HttpReply) -> Response {
         }
     }
     response
-}
-
-fn active_connection_counts(subscribers: &HashMap<u64, Subscriber>) -> BTreeMap<String, usize> {
-    let mut counts = BTreeMap::new();
-    for subscriber in subscribers.values() {
-        *counts.entry(subscriber.name.clone()).or_insert(0) += 1;
-    }
-    counts
 }
 
 fn filter_owned_events(
@@ -2150,7 +2086,7 @@ sleep 5
 
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            if state.inner.subscribers.read().await.is_empty() {
+            if state.inner.subscribers.is_empty().await {
                 break;
             }
             assert!(
