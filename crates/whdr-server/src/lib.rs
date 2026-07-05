@@ -4,6 +4,7 @@ mod dispatch_window;
 mod extension_process;
 mod extension_registration;
 mod subscribers;
+mod token_control;
 mod token_store;
 
 pub use config::{

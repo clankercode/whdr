@@ -40,6 +40,7 @@ use crate::extension_process::{
 };
 use crate::extension_registration::read_registration;
 use crate::subscribers::{SubscriberRegistration, SubscriberRegistry};
+use crate::token_control::TokenControl;
 use crate::{Config, TokenStore};
 
 const INITIAL_RESPAWN_BACKOFF_MS: u64 = 250;
@@ -139,6 +140,10 @@ impl AppState {
                 started: Instant::now(),
             }),
         })
+    }
+
+    fn token_control(&self) -> TokenControl<'_> {
+        TokenControl::new(&self.inner.token_store, &self.inner.subscribers)
     }
 
     pub async fn start_extensions(&self) -> Result<()> {
@@ -1311,51 +1316,10 @@ async fn handle_control_request(state: &AppState, request: ControlRequest) -> Co
         ControlRequest::Status => ControlResponse::Status {
             status: state.status_json().await,
         },
-        ControlRequest::TokenAdd { name } => {
-            let mut store = state.inner.token_store.write().await;
-            match store.add(&name) {
-                Ok(token) => ControlResponse::Token { name, token },
-                Err(err) => ControlResponse::Error {
-                    msg: err.to_string(),
-                },
-            }
-        }
-        ControlRequest::TokenRotate { name } => {
-            let mut store = state.inner.token_store.write().await;
-            match store.rotate(&name) {
-                Ok(token) => {
-                    drop(store);
-                    state
-                        .close_subscribers_named(&name, ClosingReason::Revoked)
-                        .await;
-                    ControlResponse::Token { name, token }
-                }
-                Err(err) => ControlResponse::Error {
-                    msg: err.to_string(),
-                },
-            }
-        }
-        ControlRequest::TokenRevoke { name } => {
-            let mut store = state.inner.token_store.write().await;
-            match store.revoke(&name) {
-                Ok(()) => {
-                    drop(store);
-                    state
-                        .close_subscribers_named(&name, ClosingReason::Revoked)
-                        .await;
-                    ControlResponse::Ok
-                }
-                Err(err) => ControlResponse::Error {
-                    msg: err.to_string(),
-                },
-            }
-        }
-        ControlRequest::TokenList => {
-            let active = state.inner.subscribers.active_connection_counts().await;
-            ControlResponse::Tokens {
-                tokens: state.inner.token_store.read().await.list(&active),
-            }
-        }
+        ControlRequest::TokenAdd { name } => state.token_control().add(name).await,
+        ControlRequest::TokenRotate { name } => state.token_control().rotate(name).await,
+        ControlRequest::TokenRevoke { name } => state.token_control().revoke(name).await,
+        ControlRequest::TokenList => state.token_control().list().await,
     }
 }
 
