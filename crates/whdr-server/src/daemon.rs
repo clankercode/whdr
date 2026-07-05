@@ -1,11 +1,13 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::env;
 use std::fs;
+#[cfg(test)]
+use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -24,7 +26,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::process::Command;
-use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc, oneshot, watch};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -53,7 +55,7 @@ struct Inner {
     extensions: RwLock<HashMap<String, ExtHandle>>,
     failed_extensions: RwLock<HashMap<String, String>>,
     subscribers: RwLock<HashMap<u64, Subscriber>>,
-    supervisor: Mutex<HashMap<String, SupervisorState>>,
+    supervisor: AsyncMutex<HashMap<String, SupervisorState>>,
     next_subscriber_id: AtomicU64,
     shutting_down: AtomicBool,
     started: Instant,
@@ -69,13 +71,110 @@ struct ExtHandle {
     channels: Vec<String>,
     tx: mpsc::Sender<SrvMsg>,
     supervisor_tx: mpsc::Sender<SupervisorCommand>,
-    pending: Arc<Mutex<HashMap<Uuid, oneshot::Sender<ExtResult>>>>,
+    pending: Arc<StdMutex<HashMap<Uuid, PendingDispatch>>>,
     in_flight: Arc<AtomicUsize>,
     protocol_errors: Arc<AtomicUsize>,
     namespace_violations: Arc<AtomicUsize>,
     consecutive_timeouts: Arc<AtomicUsize>,
     restarts: Arc<AtomicUsize>,
     pid: Option<u32>,
+}
+
+struct PendingDispatch {
+    tx: oneshot::Sender<ExtResult>,
+    permit: InFlightPermit,
+}
+
+struct InFlightPermit {
+    counter: Arc<AtomicUsize>,
+}
+
+impl InFlightPermit {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        Self { counter }
+    }
+}
+
+impl Drop for InFlightPermit {
+    fn drop(&mut self) {
+        release_in_flight(&self.counter);
+    }
+}
+
+struct PendingDispatchCleanup {
+    pending: Arc<StdMutex<HashMap<Uuid, PendingDispatch>>>,
+    req_id: Uuid,
+    armed: bool,
+}
+
+impl PendingDispatchCleanup {
+    fn new(pending: Arc<StdMutex<HashMap<Uuid, PendingDispatch>>>, req_id: Uuid) -> Self {
+        Self {
+            pending,
+            req_id,
+            armed: false,
+        }
+    }
+
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    fn remove_pending(&mut self) -> bool {
+        if !self.armed {
+            return false;
+        }
+        let removed = lock_pending(&self.pending).remove(&self.req_id).is_some();
+        self.armed = false;
+        removed
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingDispatchCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            lock_pending(&self.pending).remove(&self.req_id);
+        }
+    }
+}
+
+fn lock_pending(
+    pending: &StdMutex<HashMap<Uuid, PendingDispatch>>,
+) -> std::sync::MutexGuard<'_, HashMap<Uuid, PendingDispatch>> {
+    pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(not(test))]
+fn extension_command(path: &Path) -> Command {
+    Command::new(path)
+}
+
+#[cfg(test)]
+fn extension_command(path: &Path) -> Command {
+    if is_test_shell_script(path) {
+        let mut command = Command::new("/bin/sh");
+        command.arg(path);
+        command
+    } else {
+        Command::new(path)
+    }
+}
+
+#[cfg(test)]
+fn is_test_shell_script(path: &Path) -> bool {
+    let Ok(contents) = fs::read(path) else {
+        return false;
+    };
+    contents
+        .split(|byte| *byte == b'\n')
+        .next()
+        .is_some_and(|line| line == b"#!/bin/sh")
 }
 
 struct ExtResult {
@@ -140,7 +239,7 @@ impl AppState {
                 extensions: RwLock::new(HashMap::new()),
                 failed_extensions: RwLock::new(HashMap::new()),
                 subscribers: RwLock::new(HashMap::new()),
-                supervisor: Mutex::new(HashMap::new()),
+                supervisor: AsyncMutex::new(HashMap::new()),
                 next_subscriber_id: AtomicU64::new(1),
                 shutting_down: AtomicBool::new(false),
                 started: Instant::now(),
@@ -213,7 +312,7 @@ impl AppState {
 
     async fn start_extension(&self, candidate_id: String, path: PathBuf) -> Result<()> {
         let config = self.inner.config.read().await.clone();
-        let mut child = Command::new(&path)
+        let mut child = extension_command(&path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -279,8 +378,8 @@ impl AppState {
 
         let (tx, mut rx) = mpsc::channel::<SrvMsg>(config.limits.max_in_flight.max(1) * 2);
         let (supervisor_tx, supervisor_rx) = mpsc::channel::<SupervisorCommand>(4);
-        let pending: Arc<Mutex<HashMap<Uuid, oneshot::Sender<ExtResult>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: Arc<StdMutex<HashMap<Uuid, PendingDispatch>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
         let in_flight = Arc::new(AtomicUsize::new(0));
         let protocol_errors = Arc::new(AtomicUsize::new(0));
         let namespace_violations = Arc::new(AtomicUsize::new(0));
@@ -372,7 +471,6 @@ impl AppState {
 
         let reader_state = self.clone();
         let reader_pending = pending.clone();
-        let reader_in_flight = in_flight.clone();
         let reader_protocol_errors = protocol_errors.clone();
         let reader_timeouts = consecutive_timeouts.clone();
         let reader_namespace_violations = namespace_violations.clone();
@@ -395,20 +493,17 @@ impl AppState {
                         http,
                         mut events,
                     })) => {
-                        reader_timeouts.store(0, Ordering::Relaxed);
-                        reader_in_flight
-                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                                Some(v.saturating_sub(1))
-                            })
-                            .ok();
-                        events = filter_owned_events(
-                            &reader_id,
-                            &reader_paths,
-                            &reader_channels,
-                            &reader_namespace_violations,
-                            events,
-                        );
-                        if let Some(tx) = reader_pending.lock().await.remove(&req_id) {
+                        if let Some(pending) = lock_pending(&reader_pending).remove(&req_id) {
+                            let PendingDispatch { tx, permit } = pending;
+                            drop(permit);
+                            reader_timeouts.store(0, Ordering::Relaxed);
+                            events = filter_owned_events(
+                                &reader_id,
+                                &reader_paths,
+                                &reader_channels,
+                                &reader_namespace_violations,
+                                events,
+                            );
                             let _ = tx.send(ExtResult { http, events });
                         } else {
                             warn!(ext = reader_id, %req_id, "late or unknown result dropped");
@@ -624,7 +719,7 @@ impl AppState {
         let handle = removed?;
 
         self.unroute_extension(&handle).await;
-        handle.pending.lock().await.clear();
+        lock_pending(&handle.pending).clear();
         {
             let mut unavailable = self.inner.unavailable_routes.write().await;
             if mark_unavailable {
@@ -681,7 +776,7 @@ impl AppState {
                 let Some(handle) = self.extension_handle(id, generation).await else {
                     return true;
                 };
-                let pending_empty = handle.pending.lock().await.is_empty();
+                let pending_empty = lock_pending(&handle.pending).is_empty();
                 if pending_empty && handle.in_flight.load(Ordering::Relaxed) == 0 {
                     return true;
                 }
@@ -820,13 +915,15 @@ impl ExtHandle {
         body: Bytes,
     ) -> Result<ExtResult, DispatchError> {
         let config = state.inner.config.read().await.clone();
-        if self.in_flight.load(Ordering::Relaxed) >= config.limits.max_in_flight {
+        if !reserve_in_flight(&self.in_flight, config.limits.max_in_flight) {
             return Err(DispatchError::Busy);
         }
+        let permit = InFlightPermit::new(self.in_flight.clone());
         let req_id = Uuid::new_v4();
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(req_id, tx);
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        let mut pending_cleanup = PendingDispatchCleanup::new(self.pending.clone(), req_id);
+        lock_pending(&self.pending).insert(req_id, PendingDispatch { tx, permit });
+        pending_cleanup.arm();
         let secret = config.secrets.get(&self.id).cloned();
         let msg = SrvMsg::Dispatch {
             req_id,
@@ -838,16 +935,12 @@ impl ExtHandle {
             secret,
         };
         if self.tx.send(msg).await.is_err() {
-            self.pending.lock().await.remove(&req_id);
-            self.in_flight
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(1))
-                })
-                .ok();
+            pending_cleanup.remove_pending();
             return Err(DispatchError::Dead);
         }
         match time::timeout(Duration::from_millis(config.limits.dispatch_timeout_ms), rx).await {
             Ok(Ok(mut result)) => {
+                pending_cleanup.disarm();
                 result.events = filter_owned_events(
                     &self.id,
                     &self.paths,
@@ -858,15 +951,13 @@ impl ExtHandle {
                 state.fanout(result.events.clone()).await;
                 Ok(result)
             }
-            Ok(Err(_)) => Err(DispatchError::Dead),
+            Ok(Err(_)) => {
+                pending_cleanup.disarm();
+                Err(DispatchError::Dead)
+            }
             Err(_) => {
-                self.pending.lock().await.remove(&req_id);
+                pending_cleanup.remove_pending();
                 let timeouts = self.consecutive_timeouts.fetch_add(1, Ordering::Relaxed) + 1;
-                self.in_flight
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        Some(v.saturating_sub(1))
-                    })
-                    .ok();
                 let threshold = config.limits.hang_kill_threshold.max(1);
                 if timeouts == threshold {
                     warn!(
@@ -1117,6 +1208,8 @@ pub async fn run_until_shutdown(
 }
 
 struct RunningServers {
+    #[cfg(test)]
+    sub_addr: SocketAddr,
     ingest_task: tokio::task::JoinHandle<std::io::Result<()>>,
     sub_task: tokio::task::JoinHandle<std::io::Result<()>>,
     control_task: tokio::task::JoinHandle<Result<()>>,
@@ -1133,6 +1226,10 @@ async fn start_servers(state: AppState) -> Result<RunningServers> {
     let sub_listener = TcpListener::bind(sub_addr)
         .await
         .with_context(|| format!("bind subscriber listener {sub_addr}"))?;
+    #[cfg(test)]
+    let bound_sub_addr = sub_listener
+        .local_addr()
+        .context("read subscriber listener address")?;
     let ingest_router = Router::new()
         .fallback(any(ingest_handler))
         .with_state(state.clone());
@@ -1145,6 +1242,8 @@ async fn start_servers(state: AppState) -> Result<RunningServers> {
     let sub_task = tokio::spawn(async move { axum::serve(sub_listener, sub_router).await });
     let control_task = tokio::spawn(control_loop(state.clone(), control_socket));
     Ok(RunningServers {
+        #[cfg(test)]
+        sub_addr: bound_sub_addr,
         ingest_task,
         sub_task,
         control_task,
@@ -1680,6 +1779,32 @@ fn channel_prefixes_overlap(left: &str, right: &str) -> bool {
     channel_is_in_prefix(left, right) || channel_is_in_prefix(right, left)
 }
 
+fn reserve_in_flight(counter: &AtomicUsize, max: usize) -> bool {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        if current >= max {
+            return false;
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn release_in_flight(counter: &AtomicUsize) {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(1))
+        })
+        .ok();
+}
+
 fn discover_extensions() -> Result<Vec<(String, PathBuf)>> {
     let mut found = HashMap::new();
     let Some(path_var) = env::var_os("PATH") else {
@@ -1727,9 +1852,10 @@ fn validate_path_claim(claim: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use crate::{ExtensionsConfig, LimitsConfig, ServerConfig, SubscribersConfig, TimeoutsConfig};
+    use tokio::sync::Barrier;
 
     fn test_config(root: &Path) -> Config {
         Config {
@@ -1762,11 +1888,6 @@ mod tests {
 
     fn loopback_addr() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
-    }
-
-    fn unused_loopback_addr() -> SocketAddr {
-        let listener = StdTcpListener::bind(loopback_addr()).unwrap();
-        listener.local_addr().unwrap()
     }
 
     fn write_executable_script(root: &Path, name: &str, body: String) -> PathBuf {
@@ -1823,7 +1944,7 @@ done
             let pending = {
                 let extensions = state.inner.extensions.read().await;
                 let handle = extensions.get("drain").unwrap();
-                handle.pending.lock().await.len()
+                lock_pending(&handle.pending).len()
             };
             if pending == 1 {
                 break;
@@ -1841,7 +1962,7 @@ done
                 .cloned()
                 .expect("draining extension should remain active")
         };
-        assert_eq!(handle.pending.lock().await.len(), 1);
+        assert_eq!(lock_pending(&handle.pending).len(), 1);
         assert_eq!(handle.in_flight.load(Ordering::Relaxed), 1);
         assert!(!state.inner.routes.read().await.contains_key("drain"));
 
@@ -1854,6 +1975,271 @@ done
 
         shutdown_test_extensions(&state).await;
         let _ = dispatch.await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_dispatches_reserve_max_in_flight_atomically() {
+        const DISPATCHES: usize = 16;
+
+        let temp = tempfile::tempdir().unwrap();
+        let script = write_executable_script(
+            temp.path(),
+            "whdr-ext-slow",
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"register","protocol":1}'
+while IFS= read -r _line; do
+  :
+done
+"#
+            .to_string(),
+        );
+        let mut config = test_config(temp.path());
+        config.limits.max_in_flight = 1;
+        config.limits.dispatch_timeout_ms = 100;
+        let state = AppState::new(config).await.unwrap();
+        state
+            .start_extension("slow".to_string(), script)
+            .await
+            .unwrap();
+
+        let handle = {
+            let extensions = state.inner.extensions.read().await;
+            extensions.get("slow").cloned().unwrap()
+        };
+        let barrier = Arc::new(Barrier::new(DISPATCHES + 1));
+        let mut tasks = Vec::new();
+        for _ in 0..DISPATCHES {
+            let state = state.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                state
+                    .dispatch(
+                        "slow",
+                        Method::POST,
+                        "/slow".to_string(),
+                        None,
+                        BTreeMap::new(),
+                        Bytes::new(),
+                    )
+                    .await
+            }));
+        }
+
+        barrier.wait().await;
+        time::sleep(Duration::from_millis(50)).await;
+
+        let mut busy = 0;
+        let mut timed_out = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                Err(DispatchError::Busy) => busy += 1,
+                Err(DispatchError::Timeout) => timed_out += 1,
+                Err(err) => panic!("unexpected dispatch error: {err:?}"),
+                Ok(_) => panic!("unexpected dispatch success"),
+            }
+        }
+
+        assert_eq!(timed_out, 1, "only one dispatch should reserve capacity");
+        assert_eq!(busy, DISPATCHES - 1);
+        assert_eq!(handle.in_flight.load(Ordering::Relaxed), 0);
+
+        shutdown_test_extensions(&state).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_dispatch_releases_in_flight_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = write_executable_script(
+            temp.path(),
+            "whdr-ext-ignore",
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"register","protocol":1}'
+while IFS= read -r _line; do
+  :
+done
+"#
+            .to_string(),
+        );
+        let mut config = test_config(temp.path());
+        config.limits.max_in_flight = 1;
+        config.limits.dispatch_timeout_ms = 250;
+        let state = AppState::new(config).await.unwrap();
+        state
+            .start_extension("ignore".to_string(), script)
+            .await
+            .unwrap();
+
+        let handle = {
+            let extensions = state.inner.extensions.read().await;
+            extensions.get("ignore").cloned().unwrap()
+        };
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            first_state
+                .dispatch(
+                    "ignore",
+                    Method::POST,
+                    "/ignore".to_string(),
+                    None,
+                    BTreeMap::new(),
+                    Bytes::new(),
+                )
+                .await
+        });
+
+        let pending_deadline = Instant::now() + Duration::from_millis(100);
+        loop {
+            let pending = lock_pending(&handle.pending).len();
+            if pending == 1 && handle.in_flight.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < pending_deadline,
+                "first dispatch never became in-flight"
+            );
+            time::sleep(Duration::from_millis(10)).await;
+        }
+
+        first.abort();
+        match first.await {
+            Err(err) => assert!(err.is_cancelled()),
+            Ok(_) => panic!("first dispatch completed before cancellation"),
+        }
+
+        let second = state
+            .dispatch(
+                "ignore",
+                Method::POST,
+                "/ignore".to_string(),
+                None,
+                BTreeMap::new(),
+                Bytes::new(),
+            )
+            .await;
+        assert!(
+            matches!(second, Err(DispatchError::Timeout)),
+            "capacity leaked after cancellation"
+        );
+        assert_eq!(lock_pending(&handle.pending).len(), 0);
+        assert_eq!(handle.in_flight.load(Ordering::Relaxed), 0);
+
+        shutdown_test_extensions(&state).await;
+    }
+
+    #[tokio::test]
+    async fn late_timed_out_result_does_not_release_active_dispatch_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker_path = temp.path().join("late-result-sent");
+        let script = write_executable_script(
+            temp.path(),
+            "whdr-ext-late",
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' '{{"type":"register","protocol":1}}'
+count=0
+while IFS= read -r line; do
+  req_id=$(printf '%s\n' "$line" | sed -n 's/.*"req_id":"\([^"]*\)".*/\1/p')
+  count=$((count + 1))
+  if [ "$count" -eq 1 ]; then
+    sleep 0.65
+    printf '{{"type":"result","req_id":"%s","http":{{"status":204,"headers":{{}},"body":""}},"events":[]}}\n' "$req_id"
+    printf 'sent\n' > '{}'
+  else
+    while :; do sleep 1; done
+  fi
+done
+"#,
+                marker_path.display()
+            ),
+        );
+        let mut config = test_config(temp.path());
+        config.limits.max_in_flight = 1;
+        config.limits.dispatch_timeout_ms = 400;
+        let state = AppState::new(config).await.unwrap();
+        state
+            .start_extension("late".to_string(), script)
+            .await
+            .unwrap();
+
+        let handle = {
+            let extensions = state.inner.extensions.read().await;
+            extensions.get("late").cloned().unwrap()
+        };
+
+        let first = state
+            .dispatch(
+                "late",
+                Method::POST,
+                "/late".to_string(),
+                None,
+                BTreeMap::new(),
+                Bytes::new(),
+            )
+            .await;
+        assert!(matches!(first, Err(DispatchError::Timeout)));
+        state.inner.config.write().await.limits.dispatch_timeout_ms = 1_000;
+
+        let second_state = state.clone();
+        let second = tokio::spawn(async move {
+            second_state
+                .dispatch(
+                    "late",
+                    Method::POST,
+                    "/late".to_string(),
+                    None,
+                    BTreeMap::new(),
+                    Bytes::new(),
+                )
+                .await
+        });
+
+        let pending_deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            let pending = lock_pending(&handle.pending).len();
+            if pending == 1 && handle.in_flight.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < pending_deadline,
+                "second dispatch never became in-flight"
+            );
+            time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let late_result_deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            if marker_path.exists() {
+                break;
+            }
+            assert!(
+                Instant::now() < late_result_deadline,
+                "late result was not emitted while second dispatch was active"
+            );
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        time::sleep(Duration::from_millis(75)).await;
+
+        let third = state
+            .dispatch(
+                "late",
+                Method::POST,
+                "/late".to_string(),
+                None,
+                BTreeMap::new(),
+                Bytes::new(),
+            )
+            .await;
+        match third {
+            Err(DispatchError::Busy) => {}
+            Err(err) => {
+                panic!("late result must not release the second dispatch's capacity: {err:?}")
+            }
+            Ok(_) => panic!("late result must not release the second dispatch's capacity: success"),
+        }
+
+        assert!(matches!(second.await.unwrap(), Err(DispatchError::Timeout)));
+        shutdown_test_extensions(&state).await;
     }
 
     #[tokio::test]
@@ -1942,14 +2328,12 @@ sleep 5
         let token = store.add("project-a").unwrap();
 
         let mut config = test_config(temp.path());
-        config.server.listen_addr = unused_loopback_addr();
-        config.server.sub_addr = unused_loopback_addr();
         config.subscribers.token_store = Some(token_path);
         config.subscribers.ws_idle_timeout_ms = 20;
         let state = AppState::new(config.clone()).await.unwrap();
         let servers = start_servers(state.clone()).await.unwrap();
 
-        let mut request = format!("ws://{}/subscribe", config.server.sub_addr)
+        let mut request = format!("ws://{}/subscribe", servers.sub_addr)
             .into_client_request()
             .unwrap();
         request.headers_mut().insert(

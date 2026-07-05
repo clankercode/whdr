@@ -35,6 +35,44 @@ Issue subscriber tokens with:
 target/debug/whdr --socket /tmp/whdr/ctl.sock token add project-a
 ```
 
+## Install As A Service
+
+On a Linux host with systemd:
+
+```bash
+sudo scripts/install-service.sh
+```
+
+The installer builds release binaries, installs them to `/usr/local/bin`, writes a systemd unit, and creates the default service layout:
+
+- Config: `/etc/whdr/config.toml`
+- Provider secrets: `/etc/whdr/secrets.toml`
+- Token store: `/var/lib/whdr/tokens.toml`
+- Control socket: `/run/whdr/ctl.sock`
+
+Preview the exact files and commands without changing the machine:
+
+```bash
+scripts/install-service.sh --dry-run
+```
+
+Useful overrides:
+
+```bash
+sudo scripts/install-service.sh --prefix /opt/whdr --config-dir /etc/whdr --state-dir /var/lib/whdr
+```
+
+After install:
+
+```bash
+systemctl status whdr.service
+journalctl -u whdr.service -f
+sudo whdr --socket /run/whdr/ctl.sock status
+```
+
+The service owns the control socket as `whdr:whdr` with mode `0660`. Use `sudo`
+for one-off admin commands, or add trusted administrators to the `whdr` group.
+
 ## Documentation
 
 - [Specification](docs/SPEC.md)

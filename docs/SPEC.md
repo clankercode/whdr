@@ -15,7 +15,8 @@ whdr is a single-node persistent daemon that:
 1. ingests webhooks over HTTP from external providers,
 2. routes each request to a long-lived, supervised **extension** process that parses,
    verifies, and translates it into zero or more **events**,
-3. fans events out in-memory to **subscriber** projects connected over a local socket.
+3. fans events out in-memory to **subscriber** projects connected over the subscriber
+   WebSocket listener, typically as internal LAN WebSocket connections.
 
 Extensions install like `git`/`cargo` subcommands (`whdr-ext-<id>` on `PATH`). Subscribers
 require no install and no server-side configuration.
@@ -309,7 +310,8 @@ internet-facing proxy. The subscriber plane is internal-only and must not share 
 
 ### 9.1 Connection and auth **[D-auth]**
 
-- Client opens a WebSocket to `ws://<host>:<sub_port>/subscribe` (or `wss://` with TLS, §9.3).
+- Client opens a WebSocket to `ws://<host>:<sub_port>/subscribe`. For TLS in this
+  release, terminate `wss://` at a reverse proxy and forward to the subscriber listener (§9.3).
 - The handshake MUST carry `Authorization: Bearer <token>`. The server hashes the presented
   token and looks the hash up in the **token store** (§11.1). Unknown or missing token → the
   upgrade is rejected with `401` and the connection closed. Comparison is constant-time.
@@ -342,7 +344,8 @@ Same JSON messages as before, one per WebSocket text frame:
 ```
 
 - Subscriptions are per-connection and die with it. Zero install, zero server-side config
-  *beyond issuing a token* (add a line to the tokens file + `SIGHUP`).
+  *beyond issuing a token* with the daemon-managed CLI flow
+  (`whdr token add <name>`).
 - WebSocket ping/pong (control frames) are used for liveness in addition to the app-level
   `ping`/`pong`; a subscriber that fails to answer WS pings within `ws_idle_timeout`
   (default 30 s) is dropped.
@@ -354,15 +357,18 @@ Same JSON messages as before, one per WebSocket text frame:
 
 ### 9.3 TLS **[D-tls]**
 
-Tokens cross the network, so on an untrusted segment they need TLS. Two supported modes:
+Tokens cross the network, so on an untrusted segment they need TLS. Native subscriber TLS is
+**not implemented/publish-ready in this release**: configuring `[subscribers.tls]` is rejected
+with `subscriber TLS is configured but native TLS is not implemented`.
 
-1. **Native TLS** — set `[subscribers.tls] cert = "..." key = "..."`; the server serves `wss://`
-   directly via rustls.
-2. **Proxy-terminated** — front `sub_addr` with a reverse proxy that owns TLS, same as ingest.
+Supported deployment options today:
 
-**Guardrail:** if `sub_addr` binds to anything other than a loopback address and neither TLS
-is configured nor `allow_plaintext_lan = true` is set, the server **refuses to start**. This
-forces plaintext-over-LAN to be a deliberate, reviewable choice rather than an accident.
+1. **Proxy-terminated TLS** — front `sub_addr` with a reverse proxy that owns TLS, same as ingest.
+2. **Explicit LAN plaintext** — set `allow_plaintext_lan = true` only for a reviewed trusted LAN.
+
+**Guardrail:** if `sub_addr` binds to anything other than a loopback address and
+`allow_plaintext_lan = true` is not set, the server **refuses to start**. This forces
+plaintext-over-LAN to be a deliberate, reviewable choice rather than an accident.
 
 ---
 
@@ -386,14 +392,14 @@ TOML, default `/etc/whdr/config.toml`, override with `--config`. Secrets live in
 ```toml
 [server]
 listen_addr    = "127.0.0.1:8787"   # HTTP ingest (external via proxy)
-sub_addr       = "0.0.0.0:8788"     # WebSocket subscriber plane (internal LAN)
+sub_addr       = "127.0.0.1:8788"   # WebSocket subscriber plane (loopback by default)
 control_socket = "/run/whdr/ctl.sock"  # local admin, UDS only
 
 [subscribers]
 token_store        = "/var/lib/whdr/tokens.toml"  # server-managed state (§11.1); NOT hand-edited
 allow_plaintext_lan = false          # must be true to bind sub_addr to non-loopback w/o TLS
 ws_idle_timeout_ms  = 30_000
-# [subscribers.tls] cert = "/etc/whdr/sub.crt"  key = "/etc/whdr/sub.key"   # enables wss://
+# [subscribers.tls] is rejected in this release; use proxy TLS or explicit LAN plaintext.
 
 [extensions]
 enabled       = ["github", "teams"]
@@ -480,9 +486,10 @@ tokens survive. Because the token value is only ever known at mint time, tokens 
 - **The control socket is the mint capability.** It's local UDS with filesystem permissions;
   whoever can reach it can add/rotate/revoke tokens. Keep its perms tight; it is never exposed
   over the network.
-- **TLS for the subscriber plane** is required on untrusted segments: native rustls or a TLS
-  proxy. The server refuses to bind `sub_addr` to a non-loopback address without TLS unless
-  `allow_plaintext_lan = true` is set explicitly (§9.3).
+- **TLS for the subscriber plane** is required on untrusted segments, but native subscriber TLS
+  is not implemented in this release. Use proxy TLS; `[subscribers.tls]` is rejected. The server
+  refuses to bind `sub_addr` to a non-loopback address unless `allow_plaintext_lan = true` is set
+  explicitly (§9.3).
 - **Control/admin socket stays local UDS** with filesystem permissions; `whdr status` is never
   exposed over the network.
 - Exts are trusted native processes (no sandbox). Untrusted/third-party exts would need a
@@ -564,7 +571,7 @@ cheap to reverse *now* and expensive later — flag vetoes before M2 of the plan
 | D-slow | Slow subscriber: drop newest + count, keep connection | Disconnecting punishes a consumer for a burst; silent drop hides the problem. Counted drop is honest and matches fire-and-forget MVP semantics. |
 | D-sep | Subscriber plane is a *separate* listener from HTTP ingest | Ingest is external-facing (provider webhooks originate on the internet); co-mingling would expose the internal consumer plane on that surface. |
 | D-auth | Per-subscriber named bearer tokens in a 0600 file; revocation effective on SIGHUP | A single shared token can't be revoked per consumer and gives anonymous connections in status. Named tokens cost one extra map lookup. |
-| D-tls | Native rustls *or* proxy TLS; refuse non-loopback plaintext bind unless `allow_plaintext_lan` | Tokens cross the wire; silent plaintext is the accident to prevent. Explicit opt-in matches the enable-list philosophy. |
+| D-tls | Proxy TLS now; native `[subscribers.tls]` is rejected until implemented; refuse non-loopback plaintext bind unless `allow_plaintext_lan` | Tokens cross the wire; silent plaintext is the accident to prevent. Explicit opt-in matches the enable-list philosophy. |
 | D-tokmgmt | Tokens are daemon-minted, stored **hashed** in a server-owned state file, managed at runtime via CLI over the control socket; atomic write; show-once | (a) CLI writing the file directly = two writers racing + humans needing 0600 write perms — rejected. (b) Plaintext-at-rest storage — rejected: a network auth credential shouldn't sit reusable on disk; hashing is free for high-entropy tokens. (c) Restart-to-apply — rejected: the whole request is runtime mint. Cost: tokens are no longer hand-editable (they're CLI-only) and are show-once — both acceptable, both standard for API keys. |
 
 **IGC — subscriber transport (D4), re-run.** The v0.1 spec parked "remote/off-box subscribers"
@@ -572,8 +579,8 @@ as an *inactive* goal because the system was single-node with on-box consumers. 
 assumption is now false: subscribers run on other LAN hosts. The previously-inactive goal is
 the new primary. Re-stated goals: **G-a** zero-install consumers · **G-b** works over LAN /
 multi-host (now the driving requirement) · **G-c** auth suitable for an internal network ·
-**G-d** mature transport + TLS story (don't hand-roll framing/crypto) · **G-e** consumer plane
-isolated from the internet-facing ingest surface.
+**G-d** mature transport + TLS story (don't hand-roll framing/crypto; proxy TLS until native
+subscriber TLS lands) · **G-e** consumer plane isolated from the internet-facing ingest surface.
 
 | Idea | All | G-a | G-b | G-c | G-d | G-e |
 |------|-----|-----|-----|-----|-----|-----|
@@ -583,10 +590,11 @@ isolated from the internet-facing ingest surface.
 
 UDS is eliminated — it fails the now-active G-b outright. Raw TCP clears the two hard goals but
 turns amber on auth (I'd define the handshake myself) and fails G-d (I hand-roll framing and
-the TLS integration). WebSocket clears every goal: `Authorization: Bearer` rides the standard
-handshake (G-c), tokio-tungstenite + rustls supply framing and TLS (G-d), and a dedicated
-`sub_addr` keeps it off the ingest socket (G-e). The message *types* are transport-independent,
-so nothing above the wire changed — only the framing and handshake did.
+the TLS integration). WebSocket clears the active transport goals: `Authorization: Bearer` rides
+the standard handshake (G-c), tokio-tungstenite supplies mature framing, proxy TLS supplies the
+release TLS story until native rustls is implemented (G-d), and a dedicated `sub_addr` keeps it
+off the ingest socket (G-e). The message *types* are transport-independent, so nothing above the
+wire changed — only the framing and handshake did.
 
 **WebSocket wins decisively.** Raw TCP was the only real contender and lost on G-d alone;
 if a future consumer can't speak WS, the same JSON messages drop onto a raw-TCP listener with

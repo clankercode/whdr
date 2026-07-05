@@ -86,13 +86,13 @@ WebSocket listener on `sub_addr` (tokio-tungstenite), bearer-token handshake aga
 tokens file, `welcome`/subscribe/unsubscribe/ping frames, per-connection bounded queue, drop
 counters, fan-out from both `Result.events` and unsolicited `Event`s, WS ping liveness,
 `closing` frame on shutdown/revoke. Plaintext-LAN guardrail (refuse non-loopback bind without
-TLS or `allow_plaintext_lan`). Optional native rustls (`wss://`).
+`allow_plaintext_lan`). Native subscriber TLS is not publish-ready in this release:
+`[subscribers.tls]` is rejected, so operators use proxy TLS or explicit LAN plaintext for now.
 **Exit:** two test subscribers on *separate* connections with overlapping patterns each receive
 exactly their matches; a bad/missing token is rejected at upgrade (401); revoking a token via
 SIGHUP closes its live connection with `reason:"revoked"`; a stalled subscriber accrues
 `dropped` while a healthy one loses nothing; disconnect cleans up `subs`/`conns` (asserted via
-status); server refuses to start when `sub_addr` is non-loopback with neither TLS nor the
-plaintext flag.
+status); server refuses to start when `sub_addr` is non-loopback without the plaintext flag.
 
 ### M5 — Control socket + CLI (admin plane) (S–M)
 Status JSON per SPEC §13; `whdr status` table + `--json`. **Token management:** control-socket
@@ -145,7 +145,7 @@ can start after M1; the exts need M2 to test against).
 | Secrets leak via logs | Security | `Dispatch` gets a manual `Debug` impl redacting `secret`; grep-CI check that no log call formats `SrvMsg` with derive-Debug |
 | Scope creep toward durability | MVP never ships | Durable queue is explicitly post-MVP; the only concession made now is "drops are counted", which durability will reuse |
 | Provider quirks (Teams handshake variants) | Ext rework | Fixtures from real traffic before writing the ext, not after |
-| Token leaks via logs or plaintext LAN | Security | Tokens stored **hashed** (store leak ≠ credential leak); values never logged (redacted Debug); plaintext-LAN bind requires explicit flag; native/proxy TLS documented |
+| Token leaks via logs or plaintext LAN | Security | Tokens stored **hashed** (store leak ≠ credential leak); values never logged (redacted Debug); plaintext-LAN bind requires explicit flag; proxy TLS documented; `[subscribers.tls]` rejected until native TLS lands |
 | Token-store corruption on write | Auth data loss | Atomic replace: tmp → fsync → rename, single writer through the command channel; M5 test kills mid-write and asserts the prior store still loads |
 | WS backpressure vs. per-conn queue | Slow-consumer stall or unbounded memory | Bounded outbound queue + drop-count from M4; WS ping liveness catches dead-but-open sockets |
 
@@ -154,9 +154,11 @@ can start after M1; the exts need M2 to test against).
 1. **Durable queue** — per-channel append log + per-subscriber offsets, TTL ~24 h; decide
    Redis vs. `redb` then, with "never persist secrets / consider payload encryption" as
    standing constraints. Per-subscriber offsets key off the token *name*, already available.
-2. **Stronger subscriber auth** — mTLS client certs and/or per-token pattern scopes (a token
+2. **Native subscriber TLS** — implement and verify `[subscribers.tls]`/`wss://`; until then it
+   remains rejected and operators use proxy TLS or explicit LAN plaintext.
+3. **Stronger subscriber auth** — mTLS client certs and/or per-token pattern scopes (a token
    restricted to `github.>`), layered on the existing named-token model without breaking it.
-3. **Per-path secrets** — config schema already reserved.
-4. **Raw-TCP subscriber transport** — same JSON messages for any consumer that can't speak WS
+4. **Per-path secrets** — config schema already reserved.
+5. **Raw-TCP subscriber transport** — same JSON messages for any consumer that can't speak WS
    (the runner-up in the D4 IGC); slots beside the WS listener.
-5. **WASM ext boundary (Extism)** — only if third-party exts become real.
+6. **WASM ext boundary (Extism)** — only if third-party exts become real.
