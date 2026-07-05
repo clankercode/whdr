@@ -22,8 +22,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter, Lines};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
+use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc, oneshot, watch};
 use tokio::time;
 use tracing::{debug, error, info, warn};
@@ -239,7 +240,7 @@ impl AppState {
         let mut claims = vec![id.clone()];
         claims.extend(aliases);
 
-        let (tx, mut rx) = mpsc::channel::<SrvMsg>(config.limits.max_in_flight.max(1) * 2);
+        let (tx, rx) = mpsc::channel::<SrvMsg>(config.limits.max_in_flight.max(1) * 2);
         let (supervisor_tx, supervisor_rx) = mpsc::channel::<SupervisorCommand>(4);
         let dispatches = DispatchWindow::new();
         let protocol_errors = Arc::new(AtomicUsize::new(0));
@@ -310,109 +311,20 @@ impl AppState {
             }
         }
 
-        tokio::spawn(async move {
-            let mut writer = BufWriter::new(stdin);
-            while let Some(msg) = rx.recv().await {
-                match encode_line(&msg) {
-                    Ok(line) => {
-                        if writer.write_all(line.as_bytes()).await.is_err() {
-                            break;
-                        }
-                        if writer.flush().await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        error!(error = %err, "failed to encode server message");
-                    }
-                }
-            }
-        });
-
-        let reader_state = self.clone();
-        let reader_dispatches = dispatches.clone();
-        let reader_protocol_errors = protocol_errors.clone();
-        let reader_timeouts = consecutive_timeouts.clone();
-        let reader_namespace_violations = namespace_violations.clone();
-        let reader_supervisor_tx = supervisor_tx.clone();
-        let reader_id = id.clone();
-        let reader_generation = generation;
-        let reader_paths = claims.clone();
-        let reader_channels = channels.clone();
-        tokio::spawn(async move {
-            while let Ok(Some(line)) = lines.next_line().await {
-                if !reader_state
-                    .extension_is_active(&reader_id, reader_generation)
-                    .await
-                {
-                    break;
-                }
-                match decode_line::<ExtMsg>(&line) {
-                    Ok(Some(ExtMsg::Result {
-                        req_id,
-                        http,
-                        mut events,
-                    })) => {
-                        if let Some(tx) = reader_dispatches.remove(&req_id) {
-                            reader_timeouts.store(0, Ordering::Relaxed);
-                            events = filter_owned_events(
-                                &reader_id,
-                                &reader_paths,
-                                &reader_channels,
-                                &reader_namespace_violations,
-                                events,
-                            );
-                            let _ = tx.send(ExtResult { http, events });
-                        } else {
-                            warn!(ext = reader_id, %req_id, "late or unknown result dropped");
-                        }
-                    }
-                    Ok(Some(ExtMsg::Event { ev })) => {
-                        let events = filter_owned_events(
-                            &reader_id,
-                            &reader_paths,
-                            &reader_channels,
-                            &reader_namespace_violations,
-                            vec![ev],
-                        );
-                        reader_state.fanout(events).await;
-                    }
-                    Ok(Some(ExtMsg::Log { level, msg })) => {
-                        info!(ext = reader_id, ?level, "{msg}");
-                    }
-                    Ok(Some(ExtMsg::Register { .. })) => {
-                        warn!(ext = reader_id, "duplicate register ignored");
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        let count = reader_protocol_errors.fetch_add(1, Ordering::Relaxed) + 1;
-                        let threshold = reader_state
-                            .inner
-                            .config
-                            .read()
-                            .await
-                            .limits
-                            .max_protocol_errors
-                            .max(1);
-                        warn!(
-                            ext = reader_id,
-                            error = %err,
-                            count,
-                            threshold,
-                            "protocol error"
-                        );
-                        if count >= threshold {
-                            let _ = reader_supervisor_tx
-                                .send(SupervisorCommand::KillAndRespawn {
-                                    reason: format!("{count} protocol errors"),
-                                })
-                                .await;
-                            break;
-                        }
-                    }
-                }
-            }
-        });
+        spawn_extension_writer(stdin, rx);
+        ExtensionReaderTask {
+            state: self.clone(),
+            dispatches: dispatches.clone(),
+            protocol_errors: protocol_errors.clone(),
+            namespace_violations: namespace_violations.clone(),
+            consecutive_timeouts: consecutive_timeouts.clone(),
+            supervisor_tx: supervisor_tx.clone(),
+            id: id.clone(),
+            generation,
+            paths: claims.clone(),
+            channels: channels.clone(),
+        }
+        .spawn(lines);
 
         tokio::spawn(supervise_extension(
             self.clone(),
@@ -823,6 +735,131 @@ impl ExtHandle {
                 Err(DispatchError::Timeout)
             }
         }
+    }
+}
+
+fn spawn_extension_writer(stdin: ChildStdin, mut rx: mpsc::Receiver<SrvMsg>) {
+    tokio::spawn(async move {
+        let mut writer = BufWriter::new(stdin);
+        while let Some(msg) = rx.recv().await {
+            match encode_line(&msg) {
+                Ok(line) => {
+                    if writer.write_all(line.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    if writer.flush().await.is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    error!(error = %err, "failed to encode server message");
+                }
+            }
+        }
+    });
+}
+
+struct ExtensionReaderTask {
+    state: AppState,
+    dispatches: DispatchWindow<ExtResult>,
+    protocol_errors: Arc<AtomicUsize>,
+    namespace_violations: Arc<AtomicUsize>,
+    consecutive_timeouts: Arc<AtomicUsize>,
+    supervisor_tx: mpsc::Sender<SupervisorCommand>,
+    id: String,
+    generation: Uuid,
+    paths: Vec<String>,
+    channels: Vec<String>,
+}
+
+impl ExtensionReaderTask {
+    fn spawn(self, lines: Lines<BufReader<ChildStdout>>) {
+        tokio::spawn(self.run(lines));
+    }
+
+    async fn run(self, mut lines: Lines<BufReader<ChildStdout>>) {
+        while let Ok(Some(line)) = lines.next_line().await {
+            if !self
+                .state
+                .extension_is_active(&self.id, self.generation)
+                .await
+            {
+                break;
+            }
+            match decode_line::<ExtMsg>(&line) {
+                Ok(Some(ExtMsg::Result {
+                    req_id,
+                    http,
+                    mut events,
+                })) => {
+                    if let Some(tx) = self.dispatches.remove(&req_id) {
+                        self.consecutive_timeouts.store(0, Ordering::Relaxed);
+                        events = filter_owned_events(
+                            &self.id,
+                            &self.paths,
+                            &self.channels,
+                            &self.namespace_violations,
+                            events,
+                        );
+                        let _ = tx.send(ExtResult { http, events });
+                    } else {
+                        warn!(ext = self.id, %req_id, "late or unknown result dropped");
+                    }
+                }
+                Ok(Some(ExtMsg::Event { ev })) => {
+                    let events = filter_owned_events(
+                        &self.id,
+                        &self.paths,
+                        &self.channels,
+                        &self.namespace_violations,
+                        vec![ev],
+                    );
+                    self.state.fanout(events).await;
+                }
+                Ok(Some(ExtMsg::Log { level, msg })) => {
+                    info!(ext = self.id, ?level, "{msg}");
+                }
+                Ok(Some(ExtMsg::Register { .. })) => {
+                    warn!(ext = self.id, "duplicate register ignored");
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    if self.handle_protocol_error(err.into()).await {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_protocol_error(&self, err: anyhow::Error) -> bool {
+        let count = self.protocol_errors.fetch_add(1, Ordering::Relaxed) + 1;
+        let threshold = self
+            .state
+            .inner
+            .config
+            .read()
+            .await
+            .limits
+            .max_protocol_errors
+            .max(1);
+        warn!(
+            ext = self.id,
+            error = %err,
+            count,
+            threshold,
+            "protocol error"
+        );
+        if count >= threshold {
+            let _ = self
+                .supervisor_tx
+                .send(SupervisorCommand::KillAndRespawn {
+                    reason: format!("{count} protocol errors"),
+                })
+                .await;
+            return true;
+        }
+        false
     }
 }
 
