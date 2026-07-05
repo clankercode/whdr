@@ -1,6 +1,7 @@
 mod config;
 mod daemon;
 mod dispatch_window;
+mod extension_process;
 mod extension_registration;
 mod token_store;
 

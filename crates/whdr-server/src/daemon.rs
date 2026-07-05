@@ -5,7 +5,6 @@ use std::fs;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -25,7 +24,6 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
-use tokio::process::Command;
 use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc, oneshot, watch};
 use tokio::time;
 use tracing::{debug, error, info, warn};
@@ -36,6 +34,9 @@ use whdr_proto::{
 };
 
 use crate::dispatch_window::{DispatchWait, DispatchWindow};
+use crate::extension_process::{
+    ExtensionProcess, kill_child_wait, spawn_extension_process, wait_for_child_shutdown,
+};
 use crate::extension_registration::read_registration;
 use crate::{Config, TokenStore};
 
@@ -78,33 +79,6 @@ struct ExtHandle {
     consecutive_timeouts: Arc<AtomicUsize>,
     restarts: Arc<AtomicUsize>,
     pid: Option<u32>,
-}
-
-#[cfg(not(test))]
-fn extension_command(path: &Path) -> Command {
-    Command::new(path)
-}
-
-#[cfg(test)]
-fn extension_command(path: &Path) -> Command {
-    if is_test_shell_script(path) {
-        let mut command = Command::new("/bin/sh");
-        command.arg(path);
-        command
-    } else {
-        Command::new(path)
-    }
-}
-
-#[cfg(test)]
-fn is_test_shell_script(path: &Path) -> bool {
-    let Ok(contents) = fs::read(path) else {
-        return false;
-    };
-    contents
-        .split(|byte| *byte == b'\n')
-        .next()
-        .is_some_and(|line| line == b"#!/bin/sh")
 }
 
 struct ExtResult {
@@ -242,32 +216,12 @@ impl AppState {
 
     async fn start_extension(&self, candidate_id: String, path: PathBuf) -> Result<()> {
         let config = self.inner.config.read().await.clone();
-        let mut child = extension_command(&path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("spawn extension {}", path.display()))?;
-
-        let pid = child.id();
-        let Some(stdin) = child.stdin.take() else {
-            kill_child_wait(&mut child, &candidate_id, "stdin unavailable").await;
-            bail!("extension stdin unavailable");
-        };
-        let Some(stdout) = child.stdout.take() else {
-            kill_child_wait(&mut child, &candidate_id, "stdout unavailable").await;
-            bail!("extension stdout unavailable");
-        };
-        if let Some(stderr) = child.stderr.take() {
-            let stderr_id = candidate_id.clone();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    warn!(ext = stderr_id, "{line}");
-                }
-            });
-        }
+        let ExtensionProcess {
+            mut child,
+            stdin,
+            stdout,
+            pid,
+        } = spawn_extension_process(&candidate_id, &path).await?;
 
         let mut lines = BufReader::new(stdout).lines();
         let registration =
@@ -991,66 +945,6 @@ async fn supervise_extension(
                 .write()
                 .await
                 .insert(candidate_id, err.to_string());
-        }
-    }
-}
-
-async fn wait_for_child_shutdown(child: &mut tokio::process::Child, ext: &str, term_grace_ms: u64) {
-    let grace = Duration::from_millis(term_grace_ms.max(1));
-    match time::timeout(grace, child.wait()).await {
-        Ok(Ok(status)) => {
-            debug!(ext, ?status, "extension exited after shutdown");
-            return;
-        }
-        Ok(Err(err)) => {
-            debug!(ext, error = %err, "extension wait failed after shutdown");
-            return;
-        }
-        Err(_) => {}
-    }
-
-    warn!(
-        ext,
-        term_grace_ms, "extension did not exit after shutdown; terminating"
-    );
-    terminate_child(child, ext);
-    match time::timeout(grace, child.wait()).await {
-        Ok(Ok(status)) => {
-            debug!(ext, ?status, "extension exited after terminate");
-        }
-        Ok(Err(err)) => {
-            debug!(ext, error = %err, "extension wait failed after terminate");
-        }
-        Err(_) => {
-            warn!(
-                ext,
-                term_grace_ms, "extension did not exit after terminate; killing"
-            );
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
-    }
-}
-
-fn terminate_child(child: &mut tokio::process::Child, ext: &str) {
-    #[cfg(unix)]
-    {
-        if let Some(pid) = child.id() {
-            let rc = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-            if rc == 0 {
-                return;
-            }
-            debug!(ext, pid, "failed to send SIGTERM; falling back to kill");
-        }
-    }
-    let _ = child.start_kill();
-}
-
-async fn kill_child_wait(child: &mut tokio::process::Child, ext: &str, reason: &str) {
-    match child.kill().await {
-        Ok(()) => debug!(ext, reason, "extension child killed before ready"),
-        Err(err) => {
-            debug!(ext, reason, error = %err, "failed to kill extension child before ready")
         }
     }
 }
