@@ -120,8 +120,9 @@ fn install_service_dry_run_renders_cloudflare_tunnel_companion() {
     ]);
 
     assert!(
-        stdout
-            .contains("write cloudflare tunnel config -> /tmp/whdr-test/cloudflared/whdr-hooks.yml")
+        stdout.contains(
+            "write cloudflare tunnel config -> /tmp/whdr-test/cloudflared/whdr-hooks.yml"
+        )
     );
     assert!(stdout.contains(
         "install cloudflare tunnel systemd unit -> /tmp/whdr-test/systemd/whdr-tunnel-cloudflare.service"
@@ -170,6 +171,8 @@ fn install_service_cloudflare_requires_public_host_tunnel_and_credentials() {
         "whdr-hooks",
     ]);
     assert!(
-        stderr.contains("--cloudflare-credentials-file is required when --tunnel-provider cloudflare")
+        stderr.contains(
+            "--cloudflare-credentials-file is required when --tunnel-provider cloudflare"
+        )
     );
 }
