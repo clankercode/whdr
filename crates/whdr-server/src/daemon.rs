@@ -1043,8 +1043,11 @@ pub async fn run_until_shutdown(
 struct RunningServers {
     #[cfg(test)]
     sub_addr: SocketAddr,
+    #[cfg(test)]
+    metrics_addr: Option<SocketAddr>,
     ingest_task: tokio::task::JoinHandle<std::io::Result<()>>,
     sub_task: tokio::task::JoinHandle<std::io::Result<()>>,
+    metrics_task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     control_task: tokio::task::JoinHandle<Result<()>>,
 }
 
@@ -1070,6 +1073,29 @@ async fn start_servers(state: AppState) -> Result<RunningServers> {
         .route("/subscribe", get(subscribe_handler))
         .with_state(state.clone());
 
+    let mut metrics_task = None;
+    #[cfg(test)]
+    let mut bound_metrics_addr = None;
+    if let Some(metrics_addr) = config.server.metrics_addr {
+        let metrics_listener = TcpListener::bind(metrics_addr)
+            .await
+            .with_context(|| format!("bind metrics listener {metrics_addr}"))?;
+        #[cfg(test)]
+        {
+            bound_metrics_addr = Some(
+                metrics_listener
+                    .local_addr()
+                    .context("read metrics listener address")?,
+            );
+        }
+        let metrics_router = Router::new()
+            .route("/metrics", get(metrics_handler))
+            .with_state(state.clone());
+        metrics_task = Some(tokio::spawn(async move {
+            axum::serve(metrics_listener, metrics_router).await
+        }));
+    }
+
     let ingest_task =
         tokio::spawn(async move { axum::serve(ingest_listener, ingest_router).await });
     let sub_task = tokio::spawn(async move { axum::serve(sub_listener, sub_router).await });
@@ -1077,10 +1103,26 @@ async fn start_servers(state: AppState) -> Result<RunningServers> {
     Ok(RunningServers {
         #[cfg(test)]
         sub_addr: bound_sub_addr,
+        #[cfg(test)]
+        metrics_addr: bound_metrics_addr,
         ingest_task,
         sub_task,
+        metrics_task,
         control_task,
     })
+}
+
+async fn metrics_handler(State(state): State<AppState>) -> Response {
+    let status = state.status_json().await;
+    let body = crate::metrics::render_prometheus(&status);
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
+        .into_response()
 }
 
 async fn shutdown_state(state: &AppState, servers: RunningServers) {
@@ -1089,6 +1131,9 @@ async fn shutdown_state(state: &AppState, servers: RunningServers) {
     send_shutdown_to_extensions(state).await;
     servers.ingest_task.abort();
     servers.sub_task.abort();
+    if let Some(metrics_task) = servers.metrics_task {
+        metrics_task.abort();
+    }
     servers.control_task.abort();
 }
 
@@ -1605,6 +1650,7 @@ mod tests {
                 listen_addr: loopback_addr(),
                 sub_addr: loopback_addr(),
                 control_socket: root.join("ctl.sock"),
+                metrics_addr: Some(loopback_addr()),
             },
             subscribers: SubscribersConfig {
                 token_store: Some(root.join("tokens.toml")),
@@ -2104,6 +2150,51 @@ sleep 5
 
         drop(socket);
         shutdown_state(&state, servers).await;
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_serves_prometheus_text() {
+        use tokio::io::AsyncReadExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = test_config(temp.path());
+        let state = AppState::new(config).await.unwrap();
+        let servers = start_servers(state.clone()).await.unwrap();
+        let metrics_addr = servers.metrics_addr.expect("metrics listener enabled");
+
+        let mut stream = tokio::net::TcpStream::connect(metrics_addr).await.unwrap();
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        time::timeout(Duration::from_secs(2), stream.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("text/plain"));
+        assert!(response.contains("whdr_uptime_ms "));
+        assert!(response.contains("whdr_subscriber_count 0"));
+
+        shutdown_state(&state, servers).await;
+    }
+
+    #[tokio::test]
+    async fn constructed_config_rejects_non_loopback_metrics_bind() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = test_config(temp.path());
+        config.server.metrics_addr = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
+
+        let err = match AppState::new(config).await {
+            Ok(_) => panic!("non-loopback metrics bind should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("metrics_addr must bind a loopback")
+        );
     }
 
     #[tokio::test]

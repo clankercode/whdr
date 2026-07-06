@@ -3,6 +3,7 @@ mod daemon;
 mod dispatch_window;
 mod extension_process;
 mod extension_registration;
+mod metrics;
 mod outbound_queue;
 mod subscribers;
 mod token_control;

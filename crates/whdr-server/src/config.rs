@@ -24,6 +24,9 @@ pub struct ServerConfig {
     pub listen_addr: SocketAddr,
     pub sub_addr: SocketAddr,
     pub control_socket: PathBuf,
+    /// Optional Prometheus text-format listener. Loopback only: metrics stay
+    /// on the admin plane; scrape locally or relay via a reverse proxy.
+    pub metrics_addr: Option<SocketAddr>,
 }
 
 impl Default for ServerConfig {
@@ -32,6 +35,7 @@ impl Default for ServerConfig {
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8787),
             sub_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8788),
             control_socket: PathBuf::from("/run/whdr/ctl.sock"),
+            metrics_addr: None,
         }
     }
 }
@@ -183,6 +187,13 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         if self.subscribers.tls.is_some() {
             bail!("subscriber TLS is configured but native TLS is not implemented");
+        }
+        if let Some(metrics_addr) = self.server.metrics_addr
+            && !metrics_addr.ip().is_loopback()
+        {
+            bail!(
+                "metrics_addr must bind a loopback address; scrape locally or front with a proxy"
+            );
         }
         if !self.server.sub_addr.ip().is_loopback()
             && self.subscribers.tls.is_none()
