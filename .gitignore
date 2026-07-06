@@ -3,3 +3,4 @@
 /plans/
 *.log
 *.tmp
+/.claude/
