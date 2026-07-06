@@ -104,11 +104,25 @@ impl fmt::Debug for SrvMsg {
     }
 }
 
+/// Optional resume cursor on `subscribe`: the server streams stored events
+/// with `seq > after_seq` matching the connection's patterns before live
+/// delivery (§9.4). Client-owned; the server holds no per-subscriber offset.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayRequest {
+    pub after_seq: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SubClientMsg {
-    Subscribe { patterns: Vec<String> },
-    Unsubscribe { patterns: Vec<String> },
+    Subscribe {
+        patterns: Vec<String>,
+        #[serde(default)]
+        replay: Option<ReplayRequest>,
+    },
+    Unsubscribe {
+        patterns: Vec<String>,
+    },
     Ping,
 }
 
@@ -131,6 +145,22 @@ pub enum SubServerMsg {
         ts_ms: u64,
         channel: String,
         payload_b64: String,
+    },
+    /// Replay window fully delivered up to `through_seq`; live frames follow.
+    Replayed {
+        through_seq: u64,
+    },
+    /// The requested `after_seq` predates the retained floor; events in
+    /// `(from_seq, earliest_seq)` are permanently pruned. Replay resumes
+    /// from `earliest_seq`.
+    ReplayGap {
+        from_seq: u64,
+        earliest_seq: u64,
+    },
+    /// The outbound queue evicted `dropped` events for this connection;
+    /// reconnect and replay from your cursor to recover.
+    Lagged {
+        dropped: u64,
     },
     Pong,
     Closing {

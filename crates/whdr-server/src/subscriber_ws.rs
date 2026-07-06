@@ -17,7 +17,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::watch;
 use tokio::time;
 use tracing::warn;
-use whdr_proto::{ClosingReason, SubClientMsg, SubServerMsg};
+use whdr_proto::{ClosingReason, Pattern, SubClientMsg, SubServerMsg};
 
 use crate::daemon::AppState;
 use crate::outbound_queue::OutboundQueue;
@@ -110,8 +110,23 @@ async fn subscriber_socket(state: AppState, name: String, socket: WebSocket) {
             incoming = stream.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        if handle_subscriber_text(&state, id, text.as_str(), &queue).await.is_err() {
-                            break;
+                        match handle_subscriber_text(&state, id, text.as_str(), &queue).await {
+                            Ok(replay_frames) => {
+                                // Replay is streamed directly to the sink so a
+                                // large window can't self-evict from the bounded
+                                // live queue (§9.4 [D-dedup]).
+                                let mut send_failed = false;
+                                for frame in replay_frames {
+                                    if sink.send(Message::Text(frame.into())).await.is_err() {
+                                        send_failed = true;
+                                        break;
+                                    }
+                                }
+                                if send_failed {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
                         }
                     }
                     Some(Ok(Message::Ping(payload))) => {
@@ -131,25 +146,81 @@ async fn subscriber_socket(state: AppState, name: String, socket: WebSocket) {
     state.subscribers().remove(id).await;
 }
 
+/// Handle one client frame. Returns the serialized frames that must be
+/// streamed **directly to the sink** (in order): only the replay phase uses
+/// this, so a large replay window bypasses the bounded live queue. Control
+/// acks for the ordinary path still go through the queue.
 async fn handle_subscriber_text(
     state: &AppState,
     id: u64,
     text: &str,
     queue: &OutboundQueue,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let msg: SubClientMsg = serde_json::from_str(text)?;
     match msg {
-        SubClientMsg::Subscribe { patterns } => {
-            if let Err(msg) = state.subscribers().subscribe(id, patterns).await {
+        SubClientMsg::Subscribe { patterns, replay } => {
+            if let Err(msg) = state.subscribers().subscribe(id, patterns.clone()).await {
                 queue.push_control(&SubServerMsg::Error {
                     op: "subscribe".to_string(),
                     msg,
                 });
-                return Ok(());
+                return Ok(Vec::new());
             }
-            queue.push_control(&SubServerMsg::Ok {
+            let Some(replay) = replay else {
+                queue.push_control(&SubServerMsg::Ok {
+                    op: "subscribe".to_string(),
+                });
+                return Ok(Vec::new());
+            };
+            let Some(log) = state.delivery() else {
+                // Live subscription is active; replay is simply refused.
+                queue.push_control(&SubServerMsg::Ok {
+                    op: "subscribe".to_string(),
+                });
+                queue.push_control(&SubServerMsg::Error {
+                    op: "replay".to_string(),
+                    msg: "durable delivery is not enabled".to_string(),
+                });
+                return Ok(Vec::new());
+            };
+
+            // Replay is streamed directly to the sink, so the ok ack leads the
+            // window (it cannot go through the queue or it might trail the
+            // direct frames).
+            let mut frames = vec![encode(&SubServerMsg::Ok {
                 op: "subscribe".to_string(),
-            });
+            })];
+            let parsed: Vec<Pattern> = patterns
+                .iter()
+                .filter_map(|pattern| Pattern::new(pattern.clone()).ok())
+                .collect();
+
+            let floor = log.floor_seq();
+            let mut effective_after = replay.after_seq;
+            if floor != 0 && replay.after_seq + 1 < floor {
+                // Requested cursor predates the retained floor: explicit gap.
+                frames.push(encode(&SubServerMsg::ReplayGap {
+                    from_seq: replay.after_seq,
+                    earliest_seq: floor,
+                }));
+                effective_after = floor - 1;
+            }
+
+            let head = log.head_seq();
+            for row in log.read_after(effective_after, Some(&parsed))? {
+                if row.seq > head {
+                    break; // bound the window at the head snapshot; live follows
+                }
+                frames.push(encode(&SubServerMsg::Event {
+                    id: row.id,
+                    seq: row.seq,
+                    ts_ms: row.ts_ms,
+                    channel: row.channel,
+                    payload_b64: row.payload_b64,
+                }));
+            }
+            frames.push(encode(&SubServerMsg::Replayed { through_seq: head }));
+            return Ok(frames);
         }
         SubClientMsg::Unsubscribe { patterns } => {
             state.subscribers().unsubscribe(id, &patterns).await;
@@ -161,5 +232,9 @@ async fn handle_subscriber_text(
             queue.push_control(&SubServerMsg::Pong);
         }
     }
-    Ok(())
+    Ok(Vec::new())
+}
+
+fn encode(msg: &SubServerMsg) -> String {
+    serde_json::to_string(msg).unwrap_or_default()
 }

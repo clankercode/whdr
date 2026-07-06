@@ -477,6 +477,152 @@ async fn tokens_survive_a_hard_crash_and_restart() {
     );
 }
 
+// ---------------------------------------------------------- durable delivery
+
+#[tokio::test]
+async fn subscribe_with_replay_streams_stored_then_live() {
+    let server = builder()
+        .with_fake_ext("alpha", "")
+        .unwrap()
+        .with_delivery("")
+        .start()
+        .await
+        .unwrap();
+    server.wait_ext_state("alpha", "Ready").await.unwrap();
+
+    // Emit two events while NO subscriber is connected: persisted seq 1,2.
+    for body in [b"one".as_slice(), b"two".as_slice()] {
+        let (status, _) = http_request(server.ingest_addr, "POST", "/alpha", body)
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+    }
+
+    let token = server.token_add("p").await.unwrap();
+    let (mut sub, _welcome) = WsSubscriber::connect(server.sub_addr, &token)
+        .await
+        .unwrap();
+    sub.send_json(&serde_json::json!({
+        "type": "subscribe", "patterns": ["alpha.>"], "replay": {"after_seq": 0}
+    }))
+    .await
+    .unwrap();
+
+    let ok = sub.recv(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(ok["type"], "ok");
+    let e1 = sub.recv(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(e1["type"], "event");
+    assert_eq!(e1["seq"], 1);
+    let e2 = sub.recv(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(e2["seq"], 2);
+    let replayed = sub.recv(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(replayed["type"], "replayed");
+    assert_eq!(replayed["through_seq"], 2);
+
+    // A third event now arrives live with the next seq.
+    let (status, _) = http_request(server.ingest_addr, "POST", "/alpha", b"three")
+        .await
+        .unwrap();
+    assert_eq!(status, 200);
+    let e3 = sub.recv_event(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(e3["seq"], 3);
+    // All ids distinct: dedup-by-id would be a no-op here.
+    assert_ne!(e1["id"], e2["id"]);
+    assert_ne!(e2["id"], e3["id"]);
+}
+
+#[tokio::test]
+async fn replay_below_floor_signals_replay_gap() {
+    // Size-cap to a single retained event with a fast prune cadence, so the
+    // retained floor rises above the requested cursor.
+    let server = builder()
+        .with_fake_ext("alpha", "")
+        .unwrap()
+        .with_delivery("max_events = 1\nprune_interval_secs = 1")
+        .start()
+        .await
+        .unwrap();
+    server.wait_ext_state("alpha", "Ready").await.unwrap();
+
+    for n in 0..5u8 {
+        let (status, _) = http_request(server.ingest_addr, "POST", "/alpha", &[b'a' + n])
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+    }
+
+    let token = server.token_add("p").await.unwrap();
+    // Poll: once the background prune has run, a replay from before the floor
+    // yields an explicit replay_gap. Retry until the prune has fired.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let (mut probe, _) = WsSubscriber::connect(server.sub_addr, &token)
+            .await
+            .unwrap();
+        probe
+            .send_json(&serde_json::json!({
+                "type": "subscribe", "patterns": ["alpha.>"], "replay": {"after_seq": 1}
+            }))
+            .await
+            .unwrap();
+        let ok = probe.recv(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(ok["type"], "ok");
+        let next = probe.recv(Duration::from_secs(5)).await.unwrap();
+        if next["type"] == "replay_gap" {
+            assert_eq!(next["from_seq"], 1);
+            assert_eq!(next["earliest_seq"], 5); // only seq 5 survives max_events=1
+            // Replay then continues from the floor, then replayed.
+            let ev = probe.recv(Duration::from_secs(5)).await.unwrap();
+            assert_eq!(ev["type"], "event");
+            assert_eq!(ev["seq"], 5);
+            let replayed = probe.recv(Duration::from_secs(5)).await.unwrap();
+            assert_eq!(replayed["type"], "replayed");
+            assert_eq!(replayed["through_seq"], 5);
+            break;
+        }
+        // Prune has not fired yet; the full window replayed. Retry.
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "background prune never raised the floor; last frame {next}"
+        );
+        drop(probe);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+#[tokio::test]
+async fn replay_refused_when_delivery_disabled() {
+    let server = builder()
+        .with_fake_ext("alpha", "")
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    server.wait_ext_state("alpha", "Ready").await.unwrap();
+
+    let token = server.token_add("p").await.unwrap();
+    let (mut sub, _welcome) = WsSubscriber::connect(server.sub_addr, &token)
+        .await
+        .unwrap();
+    sub.send_json(&serde_json::json!({
+        "type": "subscribe", "patterns": ["alpha.>"], "replay": {"after_seq": 0}
+    }))
+    .await
+    .unwrap();
+
+    // Live subscription still succeeds; replay is refused with an error.
+    let ok = sub.recv(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(ok["type"], "ok");
+    assert_eq!(ok["op"], "subscribe");
+    let err = sub.recv(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(err["type"], "error");
+    assert_eq!(err["op"], "replay");
+    assert!(
+        err["msg"].as_str().unwrap().contains("not enabled"),
+        "unexpected replay error msg: {err}"
+    );
+}
+
 #[tokio::test]
 async fn stale_tmp_file_does_not_break_the_token_store() {
     let server = builder()

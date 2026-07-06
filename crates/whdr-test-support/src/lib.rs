@@ -35,6 +35,7 @@ pub struct ServerBuilder {
     enabled: Vec<String>,
     limits: String,
     timeouts: String,
+    delivery: Option<String>,
     temp: tempfile::TempDir,
 }
 
@@ -48,6 +49,7 @@ impl ServerBuilder {
             enabled: Vec::new(),
             limits: String::new(),
             timeouts: String::new(),
+            delivery: None,
             temp,
         })
     }
@@ -78,6 +80,14 @@ impl ServerBuilder {
         self
     }
 
+    /// Enable durable delivery. `store_path` is set under the temp dir
+    /// automatically; `extra_lines` supplies any other `[delivery]` knobs
+    /// (e.g. `"retention_secs = 3600"`).
+    pub fn with_delivery(mut self, extra_lines: &str) -> Self {
+        self.delivery = Some(extra_lines.to_string());
+        self
+    }
+
     pub async fn start(self) -> Result<ServerHandle> {
         let ingest_addr = free_port().await?;
         let sub_addr = free_port().await?;
@@ -100,6 +110,13 @@ impl ServerBuilder {
         fs::write(&secrets_path, secrets_body)?;
         fs::set_permissions(&secrets_path, fs::Permissions::from_mode(0o600))?;
 
+        let delivery = self.delivery.as_ref().map(|extra| {
+            format!(
+                "[delivery]\nenabled = true\nstore_path = \"{}\"\n{extra}\n",
+                root.join("delivery.redb").display()
+            )
+        });
+
         let config_path = root.join("config.toml");
         write_config(WriteConfig {
             path: &config_path,
@@ -112,6 +129,7 @@ impl ServerBuilder {
             secrets_path: &secrets_path,
             limits: &self.limits,
             timeouts: &self.timeouts,
+            delivery: delivery.as_deref(),
         })?;
 
         let handle = ServerHandle {
@@ -141,6 +159,7 @@ struct WriteConfig<'a> {
     secrets_path: &'a Path,
     limits: &'a str,
     timeouts: &'a str,
+    delivery: Option<&'a str>,
 }
 
 fn write_config(cfg: WriteConfig<'_>) -> Result<()> {
@@ -171,7 +190,7 @@ enabled = [{enabled}]
 [timeouts]
 {timeouts}
 
-[secrets]
+{delivery}[secrets]
 file = "{secrets}"
 "#,
             ingest = cfg.ingest_addr,
@@ -181,6 +200,7 @@ file = "{secrets}"
             tokens = cfg.token_store.display(),
             limits = cfg.limits,
             timeouts = cfg.timeouts,
+            delivery = cfg.delivery.unwrap_or(""),
             secrets = cfg.secrets_path.display(),
         ),
     )?;
