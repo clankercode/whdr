@@ -126,6 +126,8 @@ pub enum SubServerMsg {
         msg: String,
     },
     Event {
+        id: Uuid,
+        ts_ms: u64,
         channel: String,
         payload_b64: String,
     },

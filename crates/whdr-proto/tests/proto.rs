@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use uuid::Uuid;
 use whdr_proto::{
-    ExtMsg, HttpReply, SrvMsg, channel_matches, decode_line, encode_line, validate_channel,
-    validate_pattern,
+    ExtMsg, HttpReply, SrvMsg, SubServerMsg, channel_matches, decode_line, encode_line,
+    validate_channel, validate_pattern,
 };
 
 #[test]
@@ -40,6 +40,22 @@ fn ext_and_server_messages_round_trip_as_snake_case_ndjson() {
         decode_line::<SrvMsg>(&encode_line(&srv).unwrap()).unwrap(),
         Some(srv)
     );
+}
+
+#[test]
+fn subscriber_event_frame_carries_id_and_timestamp() {
+    let msg = SubServerMsg::Event {
+        id: Uuid::parse_str("bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb").unwrap(),
+        ts_ms: 1_751_760_000_000,
+        channel: "github.push".to_string(),
+        payload_b64: "e30=".to_string(),
+    };
+
+    let line = encode_line(&msg).unwrap();
+    assert!(line.contains(r#""type":"event""#));
+    assert!(line.contains(r#""id":"bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb""#));
+    assert!(line.contains(r#""ts_ms":1751760000000"#));
+    assert_eq!(decode_line::<SubServerMsg>(&line).unwrap(), Some(msg));
 }
 
 #[test]
