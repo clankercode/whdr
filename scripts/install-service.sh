@@ -199,9 +199,11 @@ After=network.target
 [Service]
 Environment=PATH=$bindir:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=$bindir/whdr-server --config $config_file
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 User=$user
 Group=$group
+NoNewPrivileges=true
 RuntimeDirectory=whdr
 StateDirectory=whdr
 

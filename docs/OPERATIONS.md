@@ -178,12 +178,14 @@ The daemon handles **SIGHUP** as a config reload. Reload re-reads
 extensions per the new `enabled` list, and closes subscriber connections whose
 tokens are no longer valid.
 
-The installed unit does **not** define `ExecReload`, so `systemctl reload` does
-not work. Send SIGHUP directly:
+The unit defines `ExecReload` (SIGHUP), so a reload is just:
 
 ```bash
-sudo systemctl kill -s HUP whdr.service
+sudo systemctl reload whdr.service
 ```
+
+Sending the signal directly (`sudo systemctl kill -s HUP whdr.service`) is
+equivalent.
 
 **Reload does not rebind listeners.** Changes to `listen_addr`, `sub_addr`, or
 `control_socket` require a full restart:

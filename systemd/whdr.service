@@ -5,9 +5,11 @@ After=network.target
 [Service]
 Environment=PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/usr/local/bin/whdr-server --config /etc/whdr/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 User=whdr
 Group=whdr
+NoNewPrivileges=true
 RuntimeDirectory=whdr
 StateDirectory=whdr
 
