@@ -99,7 +99,9 @@ See [Tunnel Companions](docs/TUNNELS.md) for the security boundary and setup flo
 
 - [Specification](docs/SPEC.md)
 - [Implementation Plan](docs/PLAN.md)
+- [Operations Guide](docs/OPERATIONS.md)
 - [Extension Authoring Guide](docs/EXTENSIONS.md)
+- [Tunnel Companions](docs/TUNNELS.md)
 
 ## Verification
 
