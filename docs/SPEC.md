@@ -31,7 +31,7 @@ require no install and no server-side configuration.
 
 ### 1.2 Non-goals (MVP)
 
-- Durable delivery / replay (roadmap, §13).
+- Durable delivery / replay is now implemented but **opt-in and off by default** (§10, `[delivery]`); the default build is still fire-and-forget.
 - Outbound webhook sending.
 - Untrusted / third-party extensions (no sandbox; roadmap: WASM boundary).
 - Horizontal scale / clustering. **Single *server* node** — but subscribers may run on any host
@@ -330,7 +330,7 @@ Same JSON messages as before, one per WebSocket text frame:
 
 ```jsonc
 // client → server
-{"type":"subscribe",   "patterns":["github.>", "stripe.charge.succeeded"]}
+{"type":"subscribe",   "patterns":["github.>"], "replay":{"after_seq":128}}  // replay optional; omit for live-only
 {"type":"unsubscribe", "patterns":["github.>"]}
 {"type":"ping"}
 
@@ -338,15 +338,19 @@ Same JSON messages as before, one per WebSocket text frame:
 {"type":"welcome", "name":"project-a"}                 // first frame after auth; echoes identity
 {"type":"ok",      "op":"subscribe"}
 {"type":"error",   "op":"subscribe", "msg":"invalid pattern: 'github.>x'"}
-{"type":"event",   "id":"7d9c…-uuid", "ts_ms":1751760000000, "channel":"github.push", "payload_b64":"..."}
+{"type":"event",   "id":"7d9c…-uuid", "seq":128, "ts_ms":1751760000000, "channel":"github.push", "payload_b64":"..."}
+{"type":"replayed",  "through_seq":128}                 // replay window fully delivered
+{"type":"replay_gap","from_seq":10, "earliest_seq":57}  // requested cursor predates retention
+{"type":"lagged",    "dropped":42}                      // outbound queue evicted events; reconnect+replay
 {"type":"pong"}
 {"type":"closing", "reason":"shutdown"}                // reason ∈ shutdown | revoked
 ```
 
 - **Event identity [D-evid]:** the server stamps every event frame with a UUID `id` and a
   unix-milliseconds `ts_ms` at fan-out. All subscribers see the same `id` for the same event —
-  the future replay/dedup key when durable delivery lands (§10). Extensions do not supply
+  the replay/dedup key. Extensions do not supply
   these fields; the ext-facing `Event` message is unchanged.
+  A global monotonic `seq` is also stamped; it is the replay cursor (§9.4) and is additive (old clients ignore it).
 - Subscriptions are per-connection and die with it. Zero install, zero server-side config
   *beyond issuing a token* with the daemon-managed CLI flow
   (`whdr token add <name>`).
@@ -378,6 +382,21 @@ Supported deployment options today:
 `allow_plaintext_lan = true` is not set, the server **refuses to start**. This forces
 plaintext-over-LAN to be a deliberate, reviewable choice rather than an accident.
 
+### 9.4 Resume and replay **[D-replay]**
+
+Replay is **opt-in per connection**: a client resumes by sending `replay:{"after_seq":<cursor>}`
+on `subscribe`. When `[delivery] enabled`, the server streams the stored events with
+`seq > after_seq` matching that connection's patterns, then a `replayed` frame carrying the head
+`seq` it caught up to, then live delivery continues. A cursor that predates the retained floor
+yields an explicit `replay_gap` (with the earliest still-available `seq`) before replay resumes
+from that floor — pruned loss is never silent. When durability is off, a `replay` request is
+refused with `error` op `replay` while the live subscription still succeeds. Delivery is
+**at-least-once**: the server holds no per-subscriber offset (the cursor is client-owned), so a
+frame may arrive twice around the replay/live boundary; the client **dedups by `id`** and advances
+its cursor by the highest `seq` seen. A slow-consumer drop (§9, [D-slow]) surfaces a `lagged`
+frame; the client recovers by reconnecting and replaying from its cursor. The full client-facing
+contract is the **Subscriber wire protocol v2** appendix in the durable-delivery plan.
+
 ---
 
 ## 10. Delivery semantics
@@ -385,10 +404,20 @@ plaintext-over-LAN to be a deliberate, reviewable choice rather than an accident
 **MVP — fire-and-forget.** In-memory fan-out only. Offline subscriber → event lost. Slow
 subscriber → drops per §9. Accepted tradeoff for shipping; loss is *counted*, never silent.
 
-**Roadmap — durable queue (at-least-once).** Append-log per channel + per-subscriber offsets;
-reconnecting projects replay from their offset; TTL-bounded (~24 h). Store decision (Redis vs.
-embedded `redb`/segment files) deferred until this lands. Constraints that carry over: never
-persist secrets; consider payload encryption at rest; keep TTL short.
+**Durable delivery — at-least-once, opt-in ([D-store], [D-replay]).** When `[delivery] enabled`
+(default `false`), every fanned-out event is appended to an embedded **redb** log keyed by a
+global monotonic `seq`, before delivery. Subscribers resume by sending `replay.after_seq` on
+`subscribe` (§9.4): the server streams stored events `> after_seq` matching their patterns, then
+`replayed`. Retention is TTL-bounded (`retention_secs`, default 24 h) plus a size cap
+(`max_bytes`, `max_events`); the oldest events are pruned from the front. A cursor that predates
+the retained floor yields an explicit `replay_gap`, never silent loss. Delivery is at-least-once:
+clients dedup by the stable event `id` and advance their cursor by `seq`. The slow-consumer drop
+(§9, [D-slow]) is recoverable — a dropped connection receives a `lagged` frame and reconnects with
+its cursor to replay the gap. **Never persisted:** subscriber tokens, provider secrets, or
+per-subscriber identity — only `{seq, id, ts_ms, channel, payload_b64}`. At rest the store is a
+`0600` file in the state dir (§11.2); payloads are not encrypted, so the short TTL bounds exposure
+([D-dursec]). When disabled, the path is byte-for-byte the fire-and-forget MVP plus the additive
+`seq` field.
 
 ---
 
@@ -426,6 +455,14 @@ register_ms    = 5_000
 drain_ms       = 5_000
 term_grace_ms  = 3_000
 
+[delivery]                                   # opt-in durable delivery / replay (§11.2); off by default
+enabled              = false                 # off = no persistence, replay refused
+store_path           = "/var/lib/whdr/delivery.redb"
+retention_secs       = 86_400                # 24h TTL
+max_bytes            = 536_870_912           # 512 MiB size cap (sum of stored value bytes)
+max_events           = 1_000_000             # hard cap on retained event count
+prune_interval_secs  = 300                   # background prune cadence
+
 [secrets]
 file = "/etc/whdr/secrets.toml"   # must be mode 0600, owned by the whdr user; refuse to start otherwise
 ```
@@ -441,7 +478,7 @@ provider (e.g. two GitHub webhooks) is a real case but roadmap: the schema exten
 to per-path overrides (`[github] default = "...", "gh-org2" = "..."`) without a breaking
 change, so deferring costs nothing now.
 
-`SIGHUP` reloads config (enabled set, secrets, token store, limits) and triggers the rescan.
+`SIGHUP` reloads config (enabled set, secrets, token store, limits, delivery) and triggers the rescan.
 
 ### 11.1 Subscriber token store **[D-tokmgmt]**
 
@@ -476,6 +513,27 @@ crash mid-write leaves the previous store intact — never a truncated file.
 same command, so runtime state and persisted state never diverge. Restart reloads the store;
 tokens survive. Because the token value is only ever known at mint time, tokens are
 **show-once** — lose one, rotate it (§13.1).
+
+### 11.2 Delivery log **[D-store]**
+
+The durable delivery log is a single embedded **redb** file in the state dir
+(`/var/lib/whdr/delivery.redb` by default), created `0600` in a `0700` dir and owned by the whdr
+user. It is opt-in (`[delivery] enabled`, default `false`); when off, no file is created and the
+fan-out hot path takes no fsync.
+
+- **Single-writer, crash-safe.** A serialized writer allocates a contiguous `seq` run, writes all
+  rows of a fan-out batch in **one** redb transaction, and commits (one fsync) *before* any frame
+  is delivered — so an event is durable before it is sent. redb's ACID commit gives torn-write
+  safety, mirroring the token-store write discipline in §11.1.
+- **Gapless seq.** The log is gapless by construction; the only gaps are the pruned front, which
+  raises the retained floor. On boot the file is scanned once to recover head/floor/counters.
+- **Retention.** Pruned from the front while past the TTL (`retention_secs`) **or** over the size
+  caps (`max_bytes`, `max_events`), on a background cadence (`prune_interval_secs`). Front = lowest
+  seq = oldest, because seq order == arrival order under the single writer.
+- **At rest.** On open of an existing file the mode is enforced `0600` and the server **refuses to
+  start** otherwise (mirrors `secrets.toml`/`tokens.toml`). Stored rows are only
+  `{seq, id, ts_ms, channel, payload_b64}` — never tokens, provider secrets, or per-subscriber
+  identity. Payloads are not encrypted; the short TTL bounds exposure ([D-dursec]).
 
 ---
 
@@ -518,7 +576,9 @@ network-exposed.
 
 - `{"type":"status"}` returns uptime, per-ext `{id, state, pid, restarts, paths, channels,
   in_flight, protocol_errors, consecutive_timeouts, events_emitted, last_event_at_ms}`,
-  per-subscriber `{name, remote_addr, patterns, delivered, dropped}`, and global counters.
+  per-subscriber `{name, remote_addr, patterns, delivered, dropped}`, global counters, and a
+  `delivery` object `{enabled, head_seq, floor_seq, retained_events, retained_bytes,
+  persist_errors}` (just `{enabled:false}` when durability is off).
   `delivered` counts events handed to the connection writer (post-eviction);
   `dropped` counts events evicted or rejected by the queue budgets — together they account
   for every event that matched the subscriber's patterns.
@@ -530,7 +590,9 @@ network-exposed.
 - **Prometheus metrics [D-metrics]:** setting `metrics_addr` serves `GET /metrics`
   (text format 0.0.4) rendered from the same status document the control socket returns, so
   the two admin surfaces cannot disagree. The listener refuses non-loopback binds — metrics
-  stay on the admin plane; scrape locally or relay via a proxy. Disabled by default.
+  stay on the admin plane; scrape locally or relay via a proxy. Disabled by default. When
+  durable delivery is enabled, `whdr_delivery_{enabled,head_seq,floor_seq,retained_events,
+  retained_bytes,persist_errors}` gauges are exported.
 
 ### 13.1 Token management (runtime, persistent) **[D-tokmgmt]**
 
@@ -567,6 +629,11 @@ All four survive a restart because they mutate the persisted store, not just mem
 | `sub_queue_bytes` | 8 MiB per connection | evict oldest + count |
 | `ws_idle_timeout` | 30 s | drop subscriber (missed WS pings) |
 | `drain_timeout` / `term_grace` | 5 s / 3 s | escalate TERM → KILL |
+| `delivery.enabled` | `false` | replay requests refused with `error` op `replay` |
+| `delivery.retention_secs` | 24 h | oldest events pruned; requested-but-pruned seq → `replay_gap` |
+| `delivery.max_bytes` | 512 MiB | oldest events pruned to fit |
+| `delivery.max_events` | 1,000,000 | oldest events pruned to fit |
+| `delivery.prune_interval_secs` | 300 s | — |
 
 ---
 
@@ -595,6 +662,31 @@ cheap to reverse *now* and expensive later — flag vetoes before M2 of the plan
 | D-evid | Server stamps `id` (UUID) + `ts_ms` on every subscriber event frame | Durable delivery/replay/dedup (§10) needs event identity, and the subscriber wire format is expensive to change once consumers exist. Stamping in the server keeps extensions unchanged; additive fields cost nothing now. |
 | D-metrics | Optional `/metrics` listener, loopback-only, rendered from the status document | Operators want Prometheus without parsing the UDS status JSON. Loopback-only keeps it on the admin plane; a shared render source means status and metrics cannot diverge. |
 | D-tokmgmt | Tokens are daemon-minted, stored **hashed** in a server-owned state file, managed at runtime via CLI over the control socket; atomic write; show-once | (a) CLI writing the file directly = two writers racing + humans needing 0600 write perms — rejected. (b) Plaintext-at-rest storage — rejected: a network auth credential shouldn't sit reusable on disk; hashing is free for high-entropy tokens. (c) Restart-to-apply — rejected: the whole request is runtime mint. Cost: tokens are no longer hand-editable (they're CLI-only) and are show-once — both acceptable, both standard for API keys. |
+| D-store | Embedded **redb** single-file log for durable delivery (§11.2) | **Redis** — rejected: a separate networked daemon contradicts whdr's single-node, zero-external-service ethos; it would be the only runtime service dependency. **Hand-rolled segment/append log** — rejected: durability is the whole point, and a bespoke log reintroduces the crash-safety burden a store removes (torn-tail recovery, fsync ordering, segment-roll atomicity, index rebuild). redb gives ACID commits, crash safety, and ordered range scans as one pure-Rust crate. See store-choice IGC below. |
+| D-seq | A **global monotonic `u64` seq** stamped per event at fan-out, additive on every event frame | Not exposing seq on live frames — rejected: clients need one ordering/cursor key that is identical live or replayed, and seq is near-free and additive (old clients ignore it). Reusing `ts_ms` as the cursor — rejected: wall-clock is non-unique and non-monotonic across NTP steps. |
+| D-replay | **Client-supplied resume cursor** on `subscribe` (`replay.after_seq`); server holds no per-subscriber offset | **Server-tracked per-subscriber offsets + acks** — rejected: §9.1 allows multiple concurrent connections under one token, so a single server-side offset per name is ambiguous and corruptible, needs durable per-subscriber state + an ack protocol, and fights the per-connection subscription model (§9.2). Client-owned cursors match that model, need no acks, and give at-least-once as long as the client persists its cursor and replays on reconnect. |
+| D-ret | TTL-bounded (**24 h default**) **plus** a size cap (bytes + event count); prune from the front (lowest seq = oldest) | TTL only — rejected: a burst can blow disk before the TTL fires. Size only — rejected: stale payloads shouldn't linger past the short-exposure window that justifies plaintext-at-rest (D-dursec). Both bounds, front-truncating, because seq order == arrival order == ts order under the single writer. |
+| D-gap | A requested `after_seq` below the retained floor yields an explicit **`replay_gap`** (with the earliest available seq), then replay continues from that floor | Silent truncation — rejected: the D-slow philosophy is "loss is counted, never silent"; a replay that quietly skips pruned events is silent loss. The client must learn it missed a range so it can reconcile out-of-band. |
+| D-dursec | **Documented file-permission posture** (`0700` dir, `0600` file, whdr-user owned, refuse-to-start on wrong perms), **not** encryption at rest, bounded by the short TTL | Encryption at rest — rejected *for this release*: it needs key management, and a key on the same disk adds negligible protection against the actual single-node threat (filesystem access), while an external KMS reintroduces the external dependency rejected in D-store. Matches the existing `secrets.toml`/`tokens.toml` posture. Payload encryption reserved as a future option (§16). |
+| D-dur-optin | Feature is **off by default** (`[delivery] enabled = false`); when off no file is created, no fsync on the hot path, replay is refused | On by default — rejected: durability silently writes possibly-sensitive payloads to disk and adds fsync latency to fan-out; MVP is explicitly fire-and-forget (§10), so enabling must be a deliberate, reviewable operator choice, consistent with the enable-list philosophy. |
+| D-lag | The slow-consumer drop (D-slow) gains an explicit **`lagged`** control frame; recovery is via the client's own cursor | Relying on the client to infer loss from seq gaps — rejected: seq is *global*, so gaps are normal (they mark other subscribers' events). A client cannot distinguish "gap because not my channel" from "gap because dropped". Loss must be explicit; the `lagged` frame carries the drop count and the client resumes from its last-received seq. |
+| D-dedup | At-least-once with **client dedup by `id`**; server replay is best-effort ascending, not strictly ordered around the live/replay boundary | Server-enforced strict global ordering to every queue (a single fan-out lock spanning every fsync) — rejected: it serialises all delivery behind disk latency for a guarantee the client can cheaply provide. The durable *log* is written by a single serialized writer (gapless, ordered), but frame *delivery* stays concurrent; the client dedups by the stable `id` and advances its cursor by the highest seq seen, tolerating the small replay/live overlap at reconnect without a global lock. |
+
+**IGC — store choice (D-store).** Goals for the backing store: **S-a** crash-safe (a mid-write
+crash never corrupts or loses committed events) · **S-b** ordered replay-by-cursor (range scan
+from a seq) · **S-c** cheap TTL+size pruning · **S-d** dependency-light (no external service,
+minimal/pure-Rust deps, testable in a temp dir) · **S-e** single-node fit.
+
+| Option | All | S-a | S-b | S-c | S-d | S-e |
+|--------|-----|-----|-----|-----|-----|-----|
+| Redis | ✘ | ✔ | ✔ | ✔ | ✘ (external daemon) | ✘ (built for networked/multi) |
+| Hand-rolled segment log | ? | ? (bespoke torn-tail/roll recovery) | ✔ | ✔ (unlink segment) | ✔ | ✔ |
+| **redb** | ✔ | ✔ (ACID commit) | ✔ (range scan) | ✔ (front range-delete) | ✔ (one pure-Rust crate) | ✔ |
+
+Redis fails S-d/S-e outright. The segment log clears the hard goals but turns amber on S-a — the
+one property the feature exists to guarantee — because crash correctness is hand-rolled. redb
+clears every goal with a single pure-Rust dependency. **redb wins decisively;** the segment log
+was the only real contender and lost on the property that matters most.
 
 **IGC — subscriber transport (D4), re-run.** The v0.1 spec parked "remote/off-box subscribers"
 as an *inactive* goal because the system was single-node with on-box consumers. That
@@ -626,6 +718,7 @@ no protocol change.
 
 ## 16. Open items deliberately left open
 
-- Durable-queue backing store (Redis vs. `redb`) — decide when durability lands, not before.
+- Payload encryption at rest for the delivery log — reserved; the current posture is 0600 file perms + short TTL ([D-dursec]).
+- Server-side compaction beyond TTL+size pruning — deferred.
 - WASM sandbox for third-party exts — out of scope until there *are* third-party exts.
 - Per-path secrets — schema reserved (§11), implementation deferred.
