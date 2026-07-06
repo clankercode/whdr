@@ -100,7 +100,7 @@ jobs:
           package="whdr-${version}-${PLATFORM}"
           mkdir -p "dist/${package}" dist/release
 
-          for bin in whdr-server whdr whdr-ext-dev whdr-ext-github whdr-ext-teams; do
+          for bin in whdr-server whdr whdr-ext-dev whdr-ext-github whdr-ext-teams whdr-ext-hmac; do
             cp "target/release/${bin}" "dist/${package}/${bin}"
           done
           cp README.md "dist/${package}/README.md"
