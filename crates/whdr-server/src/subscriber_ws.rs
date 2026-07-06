@@ -88,6 +88,17 @@ async fn subscriber_socket(state: AppState, name: String, socket: WebSocket) {
                 awaiting_pong = true;
             }
             frame = queue.pop() => {
+                // Surface any coalesced slow-consumer drops as a single
+                // `lagged` frame ahead of the next event ([D-lag]); the client
+                // reconnects and replays from its cursor to recover.
+                if let Some(dropped) = queue.take_pending_lag() {
+                    let lagged = encode(&SubServerMsg::Lagged {
+                        dropped: dropped as u64,
+                    });
+                    if sink.send(Message::Text(lagged.into())).await.is_err() {
+                        break;
+                    }
+                }
                 if sink.send(Message::Text(frame.text.to_string().into())).await.is_err() {
                     break;
                 }

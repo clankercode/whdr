@@ -32,6 +32,9 @@ pub(crate) struct OutboundQueue {
     max_event_bytes: usize,
     delivered: AtomicUsize,
     dropped: AtomicUsize,
+    /// Drops not yet reported to the connection as a `lagged` frame. Coalesced
+    /// into a single frame per burst; cleared when taken (§9, [D-lag]).
+    lag_pending: AtomicUsize,
 }
 
 impl OutboundQueue {
@@ -43,6 +46,22 @@ impl OutboundQueue {
             max_event_bytes: max_event_bytes.max(1),
             delivered: AtomicUsize::new(0),
             dropped: AtomicUsize::new(0),
+            lag_pending: AtomicUsize::new(0),
+        }
+    }
+
+    fn record_drop(&self) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        self.lag_pending.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Take and clear the pending-lag count. Returns `Some(n)` if `n > 0`
+    /// evictions have accrued since the last take, else `None`. Coalesces a
+    /// burst of drops into one `lagged` frame.
+    pub(crate) fn take_pending_lag(&self) -> Option<usize> {
+        match self.lag_pending.swap(0, Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
         }
     }
 
@@ -51,7 +70,7 @@ impl OutboundQueue {
     /// oversized frame count as drops.
     pub(crate) fn push_event(&self, text: std::sync::Arc<str>) {
         if text.len() > self.max_event_bytes {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.record_drop();
             return;
         }
         {
@@ -61,7 +80,7 @@ impl OutboundQueue {
                     break;
                 };
                 frames.remove(evict_at);
-                self.dropped.fetch_add(1, Ordering::Relaxed);
+                self.record_drop();
             }
             frames.push_back(Frame {
                 text,
@@ -188,6 +207,16 @@ mod tests {
         assert_eq!(queue.dropped(), 1);
         queue.push_event(event("fits"));
         assert_eq!(&*queue.pop().await.text, "fits");
+    }
+
+    #[tokio::test]
+    async fn eviction_records_pending_lag_once_until_taken() {
+        let queue = OutboundQueue::new(1, 1 << 20);
+        queue.push_event(event("a"));
+        queue.push_event(event("b")); // evicts "a" => 1 drop
+        queue.push_event(event("c")); // evicts "b" => 2 drops
+        assert_eq!(queue.take_pending_lag(), Some(2));
+        assert_eq!(queue.take_pending_lag(), None, "coalesced; cleared after take");
     }
 
     #[tokio::test]

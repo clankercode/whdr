@@ -624,6 +624,82 @@ async fn replay_refused_when_delivery_disabled() {
 }
 
 #[tokio::test]
+async fn slow_consumer_gets_lagged_then_replays_missed_events() {
+    const EVENTS: u64 = 12;
+    const PAYLOAD_BYTES: usize = 256 * 1024;
+
+    let server = builder()
+        .with_fake_ext("alpha", "")
+        .unwrap()
+        .with_delivery("")
+        .with_limits("sub_queue_len = 1")
+        .start()
+        .await
+        .unwrap();
+    server.wait_ext_state("alpha", "Ready").await.unwrap();
+
+    let token = server.token_add("slow").await.unwrap();
+    let (mut slow, _welcome) = WsSubscriber::connect(server.sub_addr, &token)
+        .await
+        .unwrap();
+    slow.subscribe(&["alpha.>"]).await.unwrap();
+
+    // Fire a burst the slow client won't read: the server evicts oldest.
+    for n in 0..EVENTS {
+        let body = vec![b'a' + (n % 26) as u8; PAYLOAD_BYTES];
+        let (status, _) = http_request(server.ingest_addr, "POST", "/alpha", &body)
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+    }
+
+    // The client reads until it observes an explicit `lagged`. Its cursor is
+    // the highest seq processed *before* the drop notice.
+    let mut cursor = 0u64;
+    loop {
+        let frame = slow.recv(Duration::from_secs(10)).await.unwrap();
+        match frame["type"].as_str() {
+            Some("lagged") => {
+                assert!(frame["dropped"].as_u64().unwrap() > 0, "lagged dropped>0");
+                break;
+            }
+            Some("event") => cursor = cursor.max(frame["seq"].as_u64().unwrap()),
+            _ => {}
+        }
+    }
+    drop(slow);
+
+    // Reconnect and replay from the cursor: every missed seq up to head is
+    // delivered — the drop was recoverable, not permanent loss.
+    let (mut recovered, _welcome) = WsSubscriber::connect(server.sub_addr, &token)
+        .await
+        .unwrap();
+    recovered
+        .send_json(&serde_json::json!({
+            "type": "subscribe", "patterns": ["alpha.>"], "replay": {"after_seq": cursor}
+        }))
+        .await
+        .unwrap();
+    let ok = recovered.recv(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(ok["type"], "ok");
+
+    let mut replayed_seqs = Vec::new();
+    loop {
+        let frame = recovered.recv(Duration::from_secs(5)).await.unwrap();
+        match frame["type"].as_str() {
+            Some("event") => replayed_seqs.push(frame["seq"].as_u64().unwrap()),
+            Some("replayed") => {
+                assert_eq!(frame["through_seq"].as_u64().unwrap(), EVENTS);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let expected: Vec<u64> = ((cursor + 1)..=EVENTS).collect();
+    assert_eq!(replayed_seqs, expected, "replay must cover the whole gap");
+}
+
+#[tokio::test]
 async fn stale_tmp_file_does_not_break_the_token_store() {
     let server = builder()
         .with_fake_ext("alpha", "")
