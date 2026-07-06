@@ -79,6 +79,22 @@ sudo whdr --socket /run/whdr/ctl.sock status
 The service owns the control socket as `whdr:whdr` with mode `0660`. Use `sudo`
 for one-off admin commands, or add trusted administrators to the `whdr` group.
 
+## Public Webhook Ingress
+
+WHDR can sit behind any HTTPS reverse proxy or tunnel that forwards provider webhook requests to the local ingest listener. The server remains tunnel agnostic; public ingress is handled by a separate companion service.
+
+The installer can render a Cloudflare Tunnel companion service:
+
+```bash
+sudo scripts/install-service.sh \
+  --tunnel-provider cloudflare \
+  --public-host hooks.example.com \
+  --cloudflare-tunnel whdr-hooks \
+  --cloudflare-credentials-file /etc/cloudflared/whdr-hooks.json
+```
+
+See [Tunnel Companions](docs/TUNNELS.md) for the security boundary and setup flow.
+
 ## Documentation
 
 - [Specification](docs/SPEC.md)

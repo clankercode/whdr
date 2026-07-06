@@ -88,7 +88,7 @@ Exts MAY also emit unsolicited `Event` messages at any time after ready (pollers
 
 ## 4. HTTP ingest
 
-- Server listens on `listen_addr` (default `127.0.0.1:8787`). TLS termination is out of scope; front with a reverse proxy for public exposure.
+- Server listens on `listen_addr` (default `127.0.0.1:8787`). TLS termination is out of scope; front with a reverse proxy or external tunnel for public exposure. Tunnels and proxies are companion infrastructure, not WHDR runtime extensions.
 - Route resolution: first path segment is looked up in the `paths` table. **Every ext is
   automatically routable at `/<id>`; `Register.paths` claims *additional* aliases** (e.g. the
   `github` ext may claim `gh`, making both `POST /github` and `POST /gh` valid). **[D2]**
