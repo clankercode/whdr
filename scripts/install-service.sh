@@ -9,6 +9,7 @@ service_name="whdr"
 user="whdr"
 group="whdr"
 profile="release"
+listen_addr="127.0.0.1:8787"
 dry_run=0
 enable_service=1
 start_service=1
@@ -35,6 +36,7 @@ Options:
   --service-dir DIR         systemd unit directory (default: /etc/systemd/system).
   --user USER               Service user (default: whdr).
   --group GROUP             Service group (default: whdr).
+  --listen-addr ADDR        whdr ingest listen address (default: 127.0.0.1:8787).
   --debug                   Install debug-profile binaries from target/debug.
   --skip-build              Do not run cargo build first.
   --no-enable               Do not run systemctl enable.
@@ -67,6 +69,7 @@ while (($#)); do
     --service-dir) service_dir="${2:?missing value for --service-dir}"; shift ;;
     --user) user="${2:?missing value for --user}"; shift ;;
     --group) group="${2:?missing value for --group}"; shift ;;
+    --listen-addr) listen_addr="${2:?missing value for --listen-addr}"; shift ;;
     --debug) profile="debug" ;;
     --skip-build) build_bins=0 ;;
     --no-enable) enable_service=0 ;;
@@ -94,6 +97,21 @@ profile_flag=()
 if [[ "$profile" == "release" ]]; then
   profile_flag=(--release)
 fi
+
+validate_listen_addr() {
+  if [[ -z "$listen_addr" ]]; then
+    echo "--listen-addr must not be empty" >&2
+    exit 2
+  fi
+  if [[ "$listen_addr" =~ [[:space:]] ]]; then
+    echo "--listen-addr must not contain whitespace: $listen_addr" >&2
+    exit 2
+  fi
+  if [[ "$listen_addr" != *:* ]]; then
+    echo "--listen-addr must include a :port part: $listen_addr" >&2
+    exit 2
+  fi
+}
 
 validate_tunnel_options() {
   case "$tunnel_provider" in
@@ -125,6 +143,7 @@ validate_tunnel_options() {
   esac
 }
 
+validate_listen_addr
 validate_tunnel_options
 
 cloudflare_config_file="${tunnel_config_dir%/}/${cloudflare_tunnel}.yml"
@@ -133,7 +152,7 @@ tunnel_unit_file="${service_dir%/}/${tunnel_service_name}.service"
 render_config() {
   cat <<EOF
 [server]
-listen_addr = "127.0.0.1:8787"
+listen_addr = "$listen_addr"
 sub_addr = "127.0.0.1:8788"
 control_socket = "/run/whdr/ctl.sock"
 
@@ -198,7 +217,7 @@ credentials-file: $cloudflare_credentials_file
 
 ingress:
   - hostname: $public_host
-    service: http://127.0.0.1:8787
+    service: http://$listen_addr
   - service: http_status:404
 EOF
 }

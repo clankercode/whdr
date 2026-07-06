@@ -138,6 +138,34 @@ fn install_service_dry_run_renders_cloudflare_tunnel_companion() {
 }
 
 #[test]
+fn install_service_dry_run_keeps_tunnel_target_in_sync_with_listen_addr() {
+    let stdout = run_install_service(&[
+        "--dry-run",
+        "--listen-addr",
+        "127.0.0.1:9999",
+        "--tunnel-provider",
+        "cloudflare",
+        "--public-host",
+        "hooks.example.com",
+        "--cloudflare-tunnel",
+        "whdr-hooks",
+        "--cloudflare-credentials-file",
+        "/etc/cloudflared/whdr-hooks.json",
+        "--no-start",
+    ]);
+
+    assert!(stdout.contains("listen_addr = \"127.0.0.1:9999\""));
+    assert!(stdout.contains("service: http://127.0.0.1:9999"));
+}
+
+#[test]
+fn install_service_rejects_listen_addr_without_port() {
+    let (_stdout, stderr) =
+        run_install_service_fail(&["--dry-run", "--listen-addr", "nocolon", "--no-start"]);
+    assert!(stderr.contains("--listen-addr must include a :port part: nocolon"));
+}
+
+#[test]
 fn install_service_cloudflare_requires_public_host_tunnel_and_credentials() {
     let (_stdout, stderr) = run_install_service_fail(&[
         "--dry-run",

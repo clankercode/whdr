@@ -4,7 +4,7 @@ WHDR is tunnel agnostic. `whdr-server` accepts HTTP ingest on its configured loc
 
 The supported deployment model is:
 
-1. WHDR listens on `127.0.0.1:8787`.
+1. WHDR listens on `127.0.0.1:8787`. The installer derives the tunnel ingress target from the configured listen address (`--listen-addr`), so the two never drift apart.
 2. A separate tunnel or reverse proxy terminates public HTTPS.
 3. The tunnel forwards provider webhook traffic to `http://127.0.0.1:8787`.
 4. WHDR subscriber WebSocket and admin UDS surfaces remain private.
