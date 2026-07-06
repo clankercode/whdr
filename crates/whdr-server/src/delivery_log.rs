@@ -132,11 +132,7 @@ impl DeliveryLog {
     /// Serialised single writer: allocate a contiguous seq run, stamp
     /// id/ts, write all rows in one redb transaction, commit (one fsync),
     /// and return the stamped events. Gapless by construction.
-    pub(crate) async fn append(
-        &self,
-        events: Vec<Event>,
-        ts_ms: u64,
-    ) -> Result<Vec<StampedEvent>> {
+    pub(crate) async fn append(&self, events: Vec<Event>, ts_ms: u64) -> Result<Vec<StampedEvent>> {
         if events.is_empty() {
             return Ok(Vec::new());
         }
@@ -246,15 +242,13 @@ impl Shared {
 
         self.head.store(base + rows.len() as u64, Ordering::Relaxed);
         // First-ever append sets the retained floor; later appends leave it.
-        let _ = self.floor.compare_exchange(
-            0,
-            stamped[0].seq,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        let _ =
+            self.floor
+                .compare_exchange(0, stamped[0].seq, Ordering::Relaxed, Ordering::Relaxed);
         self.retained_count
             .fetch_add(rows.len() as u64, Ordering::Relaxed);
-        self.retained_bytes.fetch_add(bytes_added, Ordering::Relaxed);
+        self.retained_bytes
+            .fetch_add(bytes_added, Ordering::Relaxed);
         Ok(stamped)
     }
 

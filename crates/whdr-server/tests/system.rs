@@ -529,6 +529,12 @@ async fn subscribe_with_replay_streams_stored_then_live() {
     // All ids distinct: dedup-by-id would be a no-op here.
     assert_ne!(e1["id"], e2["id"]);
     assert_ne!(e2["id"], e3["id"]);
+
+    // The store exists and is 0600 at rest ([D-dursec]).
+    use std::os::unix::fs::PermissionsExt;
+    let store = server.config_path.parent().unwrap().join("delivery.redb");
+    let mode = std::fs::metadata(&store).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "delivery log must be 0600");
 }
 
 #[tokio::test]
@@ -621,6 +627,10 @@ async fn replay_refused_when_delivery_disabled() {
         err["msg"].as_str().unwrap().contains("not enabled"),
         "unexpected replay error msg: {err}"
     );
+
+    // Disabled path never creates a store file on disk.
+    let store = server.config_path.parent().unwrap().join("delivery.redb");
+    assert!(!store.exists(), "no delivery store when disabled");
 }
 
 #[tokio::test]

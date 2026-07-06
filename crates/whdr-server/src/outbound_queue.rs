@@ -216,7 +216,11 @@ mod tests {
         queue.push_event(event("b")); // evicts "a" => 1 drop
         queue.push_event(event("c")); // evicts "b" => 2 drops
         assert_eq!(queue.take_pending_lag(), Some(2));
-        assert_eq!(queue.take_pending_lag(), None, "coalesced; cleared after take");
+        assert_eq!(
+            queue.take_pending_lag(),
+            None,
+            "coalesced; cleared after take"
+        );
     }
 
     #[tokio::test]
