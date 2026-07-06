@@ -66,8 +66,11 @@ impl<'a> TokenControl<'a> {
 
 #[cfg(test)]
 mod tests {
-    use tokio::sync::{RwLock, mpsc, watch};
+    use std::sync::Arc;
 
+    use tokio::sync::{RwLock, watch};
+
+    use crate::outbound_queue::OutboundQueue;
     use crate::subscribers::SubscriberRegistration;
 
     use super::*;
@@ -79,13 +82,12 @@ mod tests {
         store.add("project").unwrap();
         let store = RwLock::new(store);
         let subscribers = SubscriberRegistry::new();
-        let (tx, _rx) = mpsc::channel(1);
         let (close_tx, mut close_rx) = watch::channel(None);
         subscribers
             .insert(SubscriberRegistration {
                 name: "project".to_string(),
                 remote_addr: None,
-                tx,
+                queue: Arc::new(OutboundQueue::new(1, 1024)),
                 close_tx,
             })
             .await;
@@ -106,13 +108,12 @@ mod tests {
         store.add("project").unwrap();
         let store = RwLock::new(store);
         let subscribers = SubscriberRegistry::new();
-        let (tx, _rx) = mpsc::channel(1);
         let (close_tx, _close_rx) = watch::channel(None);
         subscribers
             .insert(SubscriberRegistration {
                 name: "project".to_string(),
                 remote_addr: None,
-                tx,
+                queue: Arc::new(OutboundQueue::new(1, 1024)),
                 close_tx,
             })
             .await;

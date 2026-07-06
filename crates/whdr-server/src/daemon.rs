@@ -39,6 +39,7 @@ use crate::extension_process::{
     ExtensionProcess, kill_child_wait, spawn_extension_process, wait_for_child_shutdown,
 };
 use crate::extension_registration::read_registration;
+use crate::outbound_queue::OutboundQueue;
 use crate::subscribers::{SubscriberRegistration, SubscriberRegistry};
 use crate::token_control::TokenControl;
 use crate::{Config, TokenStore};
@@ -1143,9 +1144,11 @@ async fn subscribe_handler(
 
 async fn subscriber_socket(state: AppState, name: String, socket: WebSocket) {
     let config = state.inner.config.read().await.clone();
-    let queue_len = config.limits.sub_queue_len.max(1);
     let ws_idle_timeout = Duration::from_millis(config.subscribers.ws_idle_timeout_ms.max(1));
-    let (tx, mut rx) = mpsc::channel::<SubServerMsg>(queue_len);
+    let queue = Arc::new(OutboundQueue::new(
+        config.limits.sub_queue_len,
+        config.limits.sub_queue_bytes,
+    ));
     let (close_tx, mut close_rx) = watch::channel::<Option<ClosingReason>>(None);
     let id = state
         .inner
@@ -1153,7 +1156,7 @@ async fn subscriber_socket(state: AppState, name: String, socket: WebSocket) {
         .insert(SubscriberRegistration {
             name: name.clone(),
             remote_addr: None,
-            tx: tx.clone(),
+            queue: queue.clone(),
             close_tx,
         })
         .await;
@@ -1184,16 +1187,11 @@ async fn subscriber_socket(state: AppState, name: String, socket: WebSocket) {
                 }
                 awaiting_pong = true;
             }
-            Some(outgoing) = rx.recv() => {
-                let closing = matches!(outgoing, SubServerMsg::Closing { .. });
-                let text = match serde_json::to_string(&outgoing) {
-                    Ok(text) => text,
-                    Err(_) => continue,
-                };
-                if sink.send(Message::Text(text.into())).await.is_err() {
+            frame = queue.pop() => {
+                if sink.send(Message::Text(frame.text.to_string().into())).await.is_err() {
                     break;
                 }
-                if closing {
+                if frame.closing {
                     break;
                 }
             }
@@ -1212,7 +1210,7 @@ async fn subscriber_socket(state: AppState, name: String, socket: WebSocket) {
             incoming = stream.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        if handle_subscriber_text(&state, id, text.as_str(), &tx).await.is_err() {
+                        if handle_subscriber_text(&state, id, text.as_str(), &queue).await.is_err() {
                             break;
                         }
                     }
@@ -1237,36 +1235,30 @@ async fn handle_subscriber_text(
     state: &AppState,
     id: u64,
     text: &str,
-    tx: &mpsc::Sender<SubServerMsg>,
+    queue: &OutboundQueue,
 ) -> Result<()> {
     let msg: SubClientMsg = serde_json::from_str(text)?;
     match msg {
         SubClientMsg::Subscribe { patterns } => {
             if let Err(msg) = state.inner.subscribers.subscribe(id, patterns).await {
-                let _ = tx
-                    .send(SubServerMsg::Error {
-                        op: "subscribe".to_string(),
-                        msg,
-                    })
-                    .await;
+                queue.push_control(&SubServerMsg::Error {
+                    op: "subscribe".to_string(),
+                    msg,
+                });
                 return Ok(());
             }
-            let _ = tx
-                .send(SubServerMsg::Ok {
-                    op: "subscribe".to_string(),
-                })
-                .await;
+            queue.push_control(&SubServerMsg::Ok {
+                op: "subscribe".to_string(),
+            });
         }
         SubClientMsg::Unsubscribe { patterns } => {
             state.inner.subscribers.unsubscribe(id, &patterns).await;
-            let _ = tx
-                .send(SubServerMsg::Ok {
-                    op: "unsubscribe".to_string(),
-                })
-                .await;
+            queue.push_control(&SubServerMsg::Ok {
+                op: "unsubscribe".to_string(),
+            });
         }
         SubClientMsg::Ping => {
-            let _ = tx.send(SubServerMsg::Pong).await;
+            queue.push_control(&SubServerMsg::Pong);
         }
     }
     Ok(())
