@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -40,7 +40,7 @@ use crate::extension_process::{
 };
 use crate::extension_registration::read_registration;
 use crate::outbound_queue::OutboundQueue;
-use crate::subscribers::{SubscriberRegistration, SubscriberRegistry};
+use crate::subscribers::{SubscriberRegistration, SubscriberRegistry, now_unix_ms};
 use crate::token_control::TokenControl;
 use crate::{Config, TokenStore};
 
@@ -81,12 +81,40 @@ struct ExtHandle {
     namespace_violations: Arc<AtomicUsize>,
     consecutive_timeouts: Arc<AtomicUsize>,
     restarts: Arc<AtomicUsize>,
+    event_stats: Arc<EventStats>,
     pid: Option<u32>,
 }
 
 struct ExtResult {
     http: HttpReply,
     events: Vec<Event>,
+}
+
+/// Event-emission stats per extension. `last_event_at_ms` makes silent
+/// pollers visible in status: pure pollers take no dispatches, so timeouts
+/// can't detect their failure — silence here is the only signal [D7].
+#[derive(Default)]
+struct EventStats {
+    emitted: AtomicUsize,
+    last_event_at_ms: AtomicU64,
+}
+
+impl EventStats {
+    fn record(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.emitted.fetch_add(count, Ordering::Relaxed);
+        self.last_event_at_ms
+            .store(now_unix_ms(), Ordering::Relaxed);
+    }
+
+    fn last_event_at_ms(&self) -> Option<u64> {
+        match self.last_event_at_ms.load(Ordering::Relaxed) {
+            0 => None,
+            at => Some(at),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -242,6 +270,7 @@ impl AppState {
         let namespace_violations = Arc::new(AtomicUsize::new(0));
         let consecutive_timeouts = Arc::new(AtomicUsize::new(0));
         let restarts = Arc::new(AtomicUsize::new(self.restart_count(&candidate_id).await));
+        let event_stats = Arc::new(EventStats::default());
         let generation = Uuid::new_v4();
 
         let handle = ExtHandle {
@@ -258,6 +287,7 @@ impl AppState {
             namespace_violations: namespace_violations.clone(),
             consecutive_timeouts: consecutive_timeouts.clone(),
             restarts: restarts.clone(),
+            event_stats: event_stats.clone(),
             pid,
         };
 
@@ -318,6 +348,7 @@ impl AppState {
             generation,
             paths: claims.clone(),
             channels: channels.clone(),
+            event_stats,
         }
         .spawn(lines);
 
@@ -604,6 +635,8 @@ impl AppState {
                 "protocol_errors": handle.protocol_errors.load(Ordering::Relaxed),
                 "namespace_violations": handle.namespace_violations.load(Ordering::Relaxed),
                 "consecutive_timeouts": handle.consecutive_timeouts.load(Ordering::Relaxed),
+                "events_emitted": handle.event_stats.emitted.load(Ordering::Relaxed),
+                "last_event_at_ms": handle.event_stats.last_event_at_ms(),
             }));
         }
         for (id, reason) in failed.iter() {
@@ -684,6 +717,7 @@ impl ExtHandle {
                     &self.namespace_violations,
                     result.events,
                 );
+                self.event_stats.record(result.events.len());
                 state.fanout(result.events.clone()).await;
                 Ok(result)
             }
@@ -741,6 +775,7 @@ struct ExtensionReaderTask {
     generation: Uuid,
     paths: Vec<String>,
     channels: Vec<String>,
+    event_stats: Arc<EventStats>,
 }
 
 impl ExtensionReaderTask {
@@ -785,6 +820,7 @@ impl ExtensionReaderTask {
                         &self.namespace_violations,
                         vec![ev],
                     );
+                    self.event_stats.record(events.len());
                     self.state.fanout(events).await;
                 }
                 Ok(Some(ExtMsg::Log { level, msg })) => {
@@ -1548,6 +1584,20 @@ mod tests {
 
     use crate::{ExtensionsConfig, LimitsConfig, ServerConfig, SubscribersConfig, TimeoutsConfig};
     use tokio::sync::Barrier;
+
+    #[test]
+    fn event_stats_record_tracks_count_and_recency() {
+        let stats = EventStats::default();
+        assert_eq!(stats.last_event_at_ms(), None);
+
+        stats.record(0);
+        assert_eq!(stats.emitted.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.last_event_at_ms(), None);
+
+        stats.record(3);
+        assert_eq!(stats.emitted.load(Ordering::Relaxed), 3);
+        assert!(stats.last_event_at_ms().is_some());
+    }
 
     fn test_config(root: &Path) -> Config {
         Config {

@@ -9,7 +9,7 @@ use whdr_proto::{ClosingReason, Event, Pattern, SubServerMsg, validate_pattern};
 
 use crate::outbound_queue::OutboundQueue;
 
-fn now_unix_ms() -> u64 {
+pub(crate) fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)

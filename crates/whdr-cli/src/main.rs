@@ -97,10 +97,12 @@ fn print_status(status: &serde_json::Value) {
     if let Some(exts) = status["extensions"].as_array() {
         for ext in exts {
             println!(
-                "  {}\t{}\tpid={}",
+                "  {}\t{}\tpid={}\tevents={}\tlast_event_at_ms={}",
                 ext["id"].as_str().unwrap_or("?"),
                 ext["state"].as_str().unwrap_or("?"),
-                ext["pid"]
+                ext["pid"],
+                ext["events_emitted"],
+                ext["last_event_at_ms"]
             );
         }
     }
