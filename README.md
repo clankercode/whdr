@@ -8,6 +8,7 @@ whdr is a single-node Webhook Dynamic Router. It accepts provider webhooks over 
 - `whdr-server`: daemon, extension supervisor, HTTP ingest, WebSocket subscriber plane, admin UDS.
 - `whdr-cli`: local control client, installed as `whdr`.
 - `whdr-ext-kit`: helper library for extension binaries.
+- `whdr-sub-kit`: reference Rust client library for the subscriber plane (durable delivery / replay). See [docs/SUBSCRIBERS.md](docs/SUBSCRIBERS.md).
 - `whdr-ext-dev`: development echo extension.
 - `whdr-ext-github`: GitHub webhook extension.
 - `whdr-ext-teams`: Microsoft Teams/Graph webhook extension.

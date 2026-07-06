@@ -1,0 +1,25 @@
+[package]
+name = "whdr-sub-kit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Official Rust client library for the whdr subscriber plane (durable delivery / replay)."
+
+[dependencies]
+whdr-proto = { path = "../whdr-proto", version = "0.1.0" }
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+futures-util.workspace = true
+rand.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+whdr-test-support = { path = "../whdr-test-support" }
+tempfile.workspace = true

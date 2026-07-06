@@ -4,6 +4,7 @@ members = [
     "crates/whdr-server",
     "crates/whdr-cli",
     "crates/whdr-ext-kit",
+    "crates/whdr-sub-kit",
     "crates/whdr-ext-dev",
     "crates/whdr-test-support",
     "exts/whdr-ext-github",
