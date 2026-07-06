@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::Value;
+use subtle::ConstantTimeEq;
 use whdr_ext_kit::{decode_body_b64, header_value, hmac_sha256_hex, text_reply};
 use whdr_proto::{Event, HttpReply, SrvMsg};
 
@@ -26,7 +27,11 @@ pub fn handle_github_dispatch(msg: SrvMsg) -> Result<(HttpReply, Vec<Event>)> {
     };
     let expected = github_signature(&secret, &body);
     let provided = header_value(&headers, "x-hub-signature-256").unwrap_or("");
-    if provided != expected {
+    // Constant-time compare so a byte-by-byte timing side channel can't be used
+    // to forge a signature (matches whdr-ext-teams / whdr-ext-hmac). A length
+    // mismatch fails fast and only leaks length, never signature content.
+    let signature_ok = provided.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() == 1;
+    if !signature_ok {
         return Ok((text_reply(401, "invalid signature"), vec![]));
     }
 

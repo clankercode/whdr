@@ -53,3 +53,21 @@ fn invalid_github_signature_returns_401_without_events() {
     );
     assert!(events.is_empty());
 }
+
+#[test]
+fn wrong_signature_of_correct_length_is_rejected() {
+    // A forged signature that matches the expected length exercises the
+    // constant-time byte comparison (not just the length guard): flip the
+    // last hex nibble of a valid signature and confirm it is still rejected.
+    let body = br#"{"action":"opened"}"#;
+    let valid = whdr_ext_github::github_signature("whsec", body);
+    let mut forged = valid.clone();
+    let last = forged.pop().unwrap();
+    forged.push(if last == '0' { '1' } else { '0' });
+    assert_eq!(forged.len(), valid.len());
+
+    let (reply, events) =
+        handle_github_dispatch(dispatch(body, "whsec", &forged, "pull_request")).unwrap();
+    assert_eq!(reply.status, 401);
+    assert!(events.is_empty());
+}
