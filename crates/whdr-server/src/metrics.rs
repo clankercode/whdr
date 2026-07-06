@@ -110,6 +110,26 @@ pub(crate) fn render_prometheus(status: &Value) -> String {
         gauge(&mut out, metric, &[], &global[field]);
     }
 
+    if let Some(delivery) = status["delivery"].as_object() {
+        let enabled = if delivery.get("enabled").and_then(Value::as_bool) == Some(true) {
+            Value::from(1)
+        } else {
+            Value::from(0)
+        };
+        gauge(&mut out, "whdr_delivery_enabled", &[], &enabled);
+        for (metric, field) in [
+            ("whdr_delivery_head_seq", "head_seq"),
+            ("whdr_delivery_floor_seq", "floor_seq"),
+            ("whdr_delivery_retained_events", "retained_events"),
+            ("whdr_delivery_retained_bytes", "retained_bytes"),
+            ("whdr_delivery_persist_errors", "persist_errors"),
+        ] {
+            if let Some(value) = delivery.get(field) {
+                gauge(&mut out, metric, &[], value);
+            }
+        }
+    }
+
     out
 }
 
@@ -193,6 +213,21 @@ mod tests {
         assert!(text.contains("whdr_subscriber_dropped{name=\"project-a\"} 1\n"));
         assert!(text.contains("whdr_subscriber_connections{name=\"project-a\"} 2\n"));
         assert!(text.contains("whdr_subscriber_count 2\n"));
+    }
+
+    #[test]
+    fn renders_delivery_series_when_present() {
+        let status = json!({
+            "uptime_ms": 1, "extensions": [], "subscribers": [],
+            "global": { "routes": 0, "unavailable_routes": 0, "channel_prefixes": 0, "subscriber_count": 0 },
+            "delivery": { "enabled": true, "head_seq": 9, "floor_seq": 3,
+                          "retained_events": 7, "retained_bytes": 512, "persist_errors": 0 },
+        });
+        let text = render_prometheus(&status);
+        assert!(text.contains("whdr_delivery_enabled 1\n"));
+        assert!(text.contains("whdr_delivery_head_seq 9\n"));
+        assert!(text.contains("whdr_delivery_retained_events 7\n"));
+        assert!(text.contains("whdr_delivery_persist_errors 0\n"));
     }
 
     #[test]

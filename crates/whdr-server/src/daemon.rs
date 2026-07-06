@@ -672,6 +672,17 @@ impl AppState {
             })
             .collect();
         let subscriber_count = sub_rows.len();
+        let delivery = match self.delivery() {
+            Some(log) => json!({
+                "enabled": true,
+                "head_seq": log.head_seq(),
+                "floor_seq": log.floor_seq(),
+                "retained_events": log.retained_count(),
+                "retained_bytes": log.retained_bytes(),
+                "persist_errors": self.inner.subscribers.persist_errors(),
+            }),
+            None => json!({ "enabled": false }),
+        };
         json!({
             "uptime_ms": self.inner.started.elapsed().as_millis(),
             "extensions": ext_rows,
@@ -681,7 +692,8 @@ impl AppState {
                 "unavailable_routes": self.inner.unavailable_routes.read().await.len(),
                 "channel_prefixes": self.inner.channel_prefixes.read().await.len(),
                 "subscriber_count": subscriber_count,
-            }
+            },
+            "delivery": delivery,
         })
     }
 }
