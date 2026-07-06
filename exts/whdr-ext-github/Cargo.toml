@@ -6,8 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-whdr-ext-kit = { path = "../../crates/whdr-ext-kit" }
-whdr-proto = { path = "../../crates/whdr-proto" }
+whdr-ext-kit = { path = "../../crates/whdr-ext-kit", version = "0.1.0" }
+whdr-proto = { path = "../../crates/whdr-proto", version = "0.1.0" }
 anyhow.workspace = true
 async-trait.workspace = true
 base64.workspace = true

@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-whdr-proto = { path = "../whdr-proto" }
+whdr-proto = { path = "../whdr-proto", version = "0.1.0" }
 anyhow.workspace = true
 arc-swap.workspace = true
 axum.workspace = true
@@ -39,7 +39,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-whdr-test-support = { path = "../whdr-test-support" }
+whdr-test-support = { path = "../whdr-test-support", version = "0.1.0" }
 
 [[bin]]
 name = "whdr-server"

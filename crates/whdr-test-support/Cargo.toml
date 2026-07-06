@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-whdr-proto = { path = "../whdr-proto" }
+whdr-proto = { path = "../whdr-proto", version = "0.1.0" }
 anyhow.workspace = true
 base64.workspace = true
 serde_json.workspace = true
