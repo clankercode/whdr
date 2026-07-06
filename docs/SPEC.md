@@ -519,6 +519,9 @@ network-exposed.
 - `{"type":"status"}` returns uptime, per-ext `{id, state, pid, restarts, paths, channels,
   in_flight, protocol_errors, consecutive_timeouts, events_emitted, last_event_at_ms}`,
   per-subscriber `{name, remote_addr, patterns, delivered, dropped}`, and global counters.
+  `delivered` counts events handed to the connection writer (post-eviction);
+  `dropped` counts events evicted or rejected by the queue budgets — together they account
+  for every event that matched the subscriber's patterns.
   `last_event_at_ms` exists because pure pollers cannot hang-detect via dispatch timeouts
   [D7]; their failure mode is silence, and recency makes that silence visible.
 - **`whdr status`** renders that JSON as a table; `whdr status --json` passes it through.
