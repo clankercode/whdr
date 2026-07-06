@@ -46,6 +46,7 @@ fn ext_and_server_messages_round_trip_as_snake_case_ndjson() {
 fn subscriber_event_frame_carries_id_and_timestamp() {
     let msg = SubServerMsg::Event {
         id: Uuid::parse_str("bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb").unwrap(),
+        seq: 7,
         ts_ms: 1_751_760_000_000,
         channel: "github.push".to_string(),
         payload_b64: "e30=".to_string(),
@@ -56,6 +57,26 @@ fn subscriber_event_frame_carries_id_and_timestamp() {
     assert!(line.contains(r#""id":"bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb""#));
     assert!(line.contains(r#""ts_ms":1751760000000"#));
     assert_eq!(decode_line::<SubServerMsg>(&line).unwrap(), Some(msg));
+}
+
+#[test]
+fn event_frame_carries_seq_id_and_ts() {
+    let frame = whdr_proto::SubServerMsg::Event {
+        id: uuid::Uuid::nil(),
+        seq: 42,
+        ts_ms: 1_751_760_000_000,
+        channel: "github.push".to_string(),
+        payload_b64: "AA==".to_string(),
+    };
+    let json = serde_json::to_value(&frame).unwrap();
+    assert_eq!(json["type"], "event");
+    assert_eq!(json["seq"], 42);
+    assert_eq!(json["channel"], "github.push");
+
+    // Old-client tolerance: a frame without `seq` is not something we emit,
+    // but an event we *emit* must round-trip through a full parse.
+    let round: whdr_proto::SubServerMsg = serde_json::from_value(json).unwrap();
+    assert_eq!(round, frame);
 }
 
 #[test]

@@ -19,6 +19,9 @@ pub(crate) fn now_unix_ms() -> u64 {
 pub(crate) struct SubscriberRegistry {
     subscribers: RwLock<HashMap<u64, Subscriber>>,
     next_id: AtomicU64,
+    /// In-process global event sequence for the live (non-durable) path.
+    /// When durable delivery is enabled the log owns seq allocation instead.
+    seq: AtomicU64,
 }
 
 pub(crate) struct SubscriberRegistration {
@@ -49,6 +52,7 @@ impl SubscriberRegistry {
         Self {
             subscribers: RwLock::new(HashMap::new()),
             next_id: AtomicU64::new(1),
+            seq: AtomicU64::new(0),
         }
     }
 
@@ -111,11 +115,13 @@ impl SubscriberRegistry {
         }
         let subscribers = self.subscribers.read().await;
         for event in events {
-            // The server stamps identity/time once per event, so every
-            // subscriber sees the same id — the future replay/dedup key.
+            // The server stamps identity/time/seq once per event, so every
+            // subscriber sees the same id/seq — the replay/dedup key.
             // The frame is serialized once and shared across all queues.
+            let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
             let msg = SubServerMsg::Event {
                 id: Uuid::new_v4(),
+                seq,
                 ts_ms: now_unix_ms(),
                 channel: event.channel.clone(),
                 payload_b64: event.payload_b64,
@@ -258,6 +264,30 @@ mod tests {
         let snapshots = registry.snapshots().await;
         assert_eq!(snapshots[0].delivered, 1);
         assert_eq!(snapshots[0].dropped, 1);
+    }
+
+    #[tokio::test]
+    async fn fanout_stamps_monotonic_increasing_seq() {
+        let registry = SubscriberRegistry::new();
+        let queue = Arc::new(OutboundQueue::new(8, 65_536));
+        let id = insert_subscriber(&registry, "p", queue.clone()).await;
+        registry
+            .subscribe(id, vec!["dev.>".to_string()])
+            .await
+            .unwrap();
+
+        registry
+            .fanout(vec![event("dev.one", "MQ=="), event("dev.two", "Mg==")])
+            .await;
+
+        let mut seqs = Vec::new();
+        for _ in 0..2 {
+            match decode(&queue.pop().await) {
+                SubServerMsg::Event { seq, .. } => seqs.push(seq),
+                other => panic!("expected event, got {other:?}"),
+            }
+        }
+        assert!(seqs[0] >= 1 && seqs[1] == seqs[0] + 1, "seqs: {seqs:?}");
     }
 
     #[tokio::test]
