@@ -338,22 +338,30 @@ Same JSON messages as before, one per WebSocket text frame:
 {"type":"welcome", "name":"project-a"}                 // first frame after auth; echoes identity
 {"type":"ok",      "op":"subscribe"}
 {"type":"error",   "op":"subscribe", "msg":"invalid pattern: 'github.>x'"}
-{"type":"event",   "channel":"github.push", "payload_b64":"..."}
+{"type":"event",   "id":"7d9c…-uuid", "ts_ms":1751760000000, "channel":"github.push", "payload_b64":"..."}
 {"type":"pong"}
 {"type":"closing", "reason":"shutdown"}                // reason ∈ shutdown | revoked
 ```
 
+- **Event identity [D-evid]:** the server stamps every event frame with a UUID `id` and a
+  unix-milliseconds `ts_ms` at fan-out. All subscribers see the same `id` for the same event —
+  the future replay/dedup key when durable delivery lands (§10). Extensions do not supply
+  these fields; the ext-facing `Event` message is unchanged.
 - Subscriptions are per-connection and die with it. Zero install, zero server-side config
   *beyond issuing a token* with the daemon-managed CLI flow
   (`whdr token add <name>`).
 - WebSocket ping/pong (control frames) are used for liveness in addition to the app-level
   `ping`/`pong`; a subscriber that fails to answer WS pings within `ws_idle_timeout`
   (default 30 s) is dropped.
-- **Slow-consumer policy [D-slow]:** each connection has a bounded outbound queue
-  (`sub_queue_len`, default 1024). On overflow the newest event is dropped for that subscriber
-  and its `dropped` counter increments (visible in `whdr status`). The connection is *not*
-  killed — consistent with MVP fire-and-forget semantics, and drop-counts make the loss
-  observable instead of silent.
+- **Slow-consumer policy [D-slow]:** each connection has a bounded outbound queue capped
+  both by frame count (`sub_queue_len`, default 1024) and by bytes (`sub_queue_bytes`,
+  default 8 MiB) — the byte cap bounds worst-case memory per connection regardless of
+  payload size. On overflow the **oldest queued event is evicted** (webhook consumers care
+  about freshness more than completeness) and the subscriber's `dropped` counter increments
+  (visible in `whdr status`). Event frames are serialized once and shared across all
+  subscriber queues. Control frames (ok/error/pong/closing) are never evicted. The
+  connection is *not* killed — consistent with MVP fire-and-forget semantics, and
+  drop-counts make the loss observable instead of silent.
 
 ### 9.3 TLS **[D-tls]**
 
@@ -394,6 +402,7 @@ TOML, default `/etc/whdr/config.toml`, override with `--config`. Secrets live in
 listen_addr    = "127.0.0.1:8787"   # HTTP ingest (external via proxy)
 sub_addr       = "127.0.0.1:8788"   # WebSocket subscriber plane (loopback by default)
 control_socket = "/run/whdr/ctl.sock"  # local admin, UDS only
+# metrics_addr = "127.0.0.1:9598"   # optional Prometheus text endpoint; loopback only
 
 [subscribers]
 token_store        = "/var/lib/whdr/tokens.toml"  # server-managed state (§11.1); NOT hand-edited
@@ -409,6 +418,7 @@ autostart_all = false
 max_body_bytes      = 1_048_576
 max_in_flight       = 64
 sub_queue_len       = 1024
+sub_queue_bytes     = 8_388_608     # per-connection outbound byte budget
 dispatch_timeout_ms = 10_000
 
 [timeouts]
@@ -507,11 +517,17 @@ open it can mint tokens — so it stays a local UDS gated by filesystem permissi
 network-exposed.
 
 - `{"type":"status"}` returns uptime, per-ext `{id, state, pid, restarts, paths, channels,
-  in_flight, protocol_errors, consecutive_timeouts}`, per-subscriber `{name, remote_addr,
-  patterns, delivered, dropped}`, and global counters.
+  in_flight, protocol_errors, consecutive_timeouts, events_emitted, last_event_at_ms}`,
+  per-subscriber `{name, remote_addr, patterns, delivered, dropped}`, and global counters.
+  `last_event_at_ms` exists because pure pollers cannot hang-detect via dispatch timeouts
+  [D7]; their failure mode is silence, and recency makes that silence visible.
 - **`whdr status`** renders that JSON as a table; `whdr status --json` passes it through.
 - Server logs via `tracing`; ext stderr lines are ingested and tagged `ext=<id>`; `ExtMsg::Log`
   maps levels onto the same subscriber.
+- **Prometheus metrics [D-metrics]:** setting `metrics_addr` serves `GET /metrics`
+  (text format 0.0.4) rendered from the same status document the control socket returns, so
+  the two admin surfaces cannot disagree. The listener refuses non-loopback binds — metrics
+  stay on the admin plane; scrape locally or relay via a proxy. Disabled by default.
 
 ### 13.1 Token management (runtime, persistent) **[D-tokmgmt]**
 
@@ -544,7 +560,8 @@ All four survive a restart because they mutate the persisted store, not just mem
 | `max_protocol_errors` | 3 | kill + backoff restart |
 | crashloop | 5 exits / 60 s | `Failed` until `SIGHUP` |
 | backoff | 500 ms × 2ⁿ, cap 30 s | — |
-| `sub_queue_len` | 1024 events | drop newest + count |
+| `sub_queue_len` | 1024 events | evict oldest + count |
+| `sub_queue_bytes` | 8 MiB per connection | evict oldest + count |
 | `ws_idle_timeout` | 30 s | drop subscriber (missed WS pings) |
 | `drain_timeout` / `term_grace` | 5 s / 3 s | escalate TERM → KILL |
 
@@ -568,10 +585,12 @@ cheap to reverse *now* and expensive later — flag vetoes before M2 of the plan
 | D11 | Drain: unroute → wait 5 s → `Shutdown` → TERM → KILL | Undefined drain semantics = dropped in-flight webhooks on every rescan. |
 | D13 | `subs` keyed by SubId; add `conns` table | Pattern-keyed map can't be delivered to without a SubId→connection map anyway, and pattern keys need canonicalization. Linear match is fine at MVP scale. |
 | D-ns | Exts may only emit under their claimed channel prefixes | Without it any ext can spoof any other's events; one-line check, real containment win. |
-| D-slow | Slow subscriber: drop newest + count, keep connection | Disconnecting punishes a consumer for a burst; silent drop hides the problem. Counted drop is honest and matches fire-and-forget MVP semantics. |
+| D-slow | Slow subscriber: evict **oldest** + count, keep connection; queues capped by count *and* bytes | Disconnecting punishes a consumer for a burst; silent drop hides the problem. Drop-newest (v0.1) kept stale events while losing current ones — for webhooks, freshness wins. A count-only cap left worst-case memory unbounded in payload size; the byte budget closes it. |
 | D-sep | Subscriber plane is a *separate* listener from HTTP ingest | Ingest is external-facing (provider webhooks originate on the internet); co-mingling would expose the internal consumer plane on that surface. |
 | D-auth | Per-subscriber named bearer tokens in a 0600 file; revocation effective on SIGHUP | A single shared token can't be revoked per consumer and gives anonymous connections in status. Named tokens cost one extra map lookup. |
 | D-tls | Proxy TLS now; native `[subscribers.tls]` is rejected until implemented; refuse non-loopback plaintext bind unless `allow_plaintext_lan` | Tokens cross the wire; silent plaintext is the accident to prevent. Explicit opt-in matches the enable-list philosophy. |
+| D-evid | Server stamps `id` (UUID) + `ts_ms` on every subscriber event frame | Durable delivery/replay/dedup (§10) needs event identity, and the subscriber wire format is expensive to change once consumers exist. Stamping in the server keeps extensions unchanged; additive fields cost nothing now. |
+| D-metrics | Optional `/metrics` listener, loopback-only, rendered from the status document | Operators want Prometheus without parsing the UDS status JSON. Loopback-only keeps it on the admin plane; a shared render source means status and metrics cannot diverge. |
 | D-tokmgmt | Tokens are daemon-minted, stored **hashed** in a server-owned state file, managed at runtime via CLI over the control socket; atomic write; show-once | (a) CLI writing the file directly = two writers racing + humans needing 0600 write perms — rejected. (b) Plaintext-at-rest storage — rejected: a network auth credential shouldn't sit reusable on disk; hashing is free for high-entropy tokens. (c) Restart-to-apply — rejected: the whole request is runtime mint. Cost: tokens are no longer hand-editable (they're CLI-only) and are show-once — both acceptable, both standard for API keys. |
 
 **IGC — subscriber transport (D4), re-run.** The v0.1 spec parked "remote/off-box subscribers"

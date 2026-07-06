@@ -35,6 +35,12 @@ Issue subscriber tokens with:
 target/debug/whdr --socket /tmp/whdr/ctl.sock token add project-a
 ```
 
+## Observability
+
+`whdr status` over the control socket is the primary admin surface. Optionally set
+`metrics_addr = "127.0.0.1:9598"` under `[server]` to serve Prometheus text metrics at
+`GET /metrics` — loopback only, rendered from the same data as `whdr status`.
+
 ## Install As A Service
 
 On a Linux host with systemd:

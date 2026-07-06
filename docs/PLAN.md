@@ -153,7 +153,8 @@ can start after M1; the exts need M2 to test against).
 
 1. **Durable queue** — per-channel append log + per-subscriber offsets, TTL ~24 h; decide
    Redis vs. `redb` then, with "never persist secrets / consider payload encryption" as
-   standing constraints. Per-subscriber offsets key off the token *name*, already available.
+   standing constraints. Per-subscriber offsets key off the token *name*, already available;
+   replay/dedup keys off the event `id`/`ts_ms` already stamped on every frame [D-evid].
 2. **Native subscriber TLS** — implement and verify `[subscribers.tls]`/`wss://`; until then it
    remains rejected and operators use proxy TLS or explicit LAN plaintext.
 3. **Stronger subscriber auth** — mTLS client certs and/or per-token pattern scopes (a token
@@ -162,3 +163,7 @@ can start after M1; the exts need M2 to test against).
 5. **Raw-TCP subscriber transport** — same JSON messages for any consumer that can't speak WS
    (the runner-up in the D4 IGC); slots beside the WS listener.
 6. **WASM ext boundary (Extism)** — only if third-party exts become real.
+
+Shipped since v0.1 of this plan: Prometheus `/metrics` (loopback-only, [D-metrics]),
+event `id`/`ts_ms` stamping [D-evid], byte-budgeted drop-oldest subscriber queues
+(revised [D-slow]), and per-ext `events_emitted`/`last_event_at_ms` in status.

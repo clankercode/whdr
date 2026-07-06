@@ -2,6 +2,7 @@
 listen_addr = "127.0.0.1:8787"
 sub_addr = "127.0.0.1:8788"
 control_socket = "/tmp/whdr/ctl.sock"
+# metrics_addr = "127.0.0.1:9598"  # optional Prometheus endpoint; loopback only
 
 [subscribers]
 token_store = "/tmp/whdr/tokens.toml"
@@ -16,6 +17,7 @@ autostart_all = false
 max_body_bytes = 1048576
 max_in_flight = 64
 sub_queue_len = 1024
+sub_queue_bytes = 8388608
 dispatch_timeout_ms = 10000
 
 [timeouts]
