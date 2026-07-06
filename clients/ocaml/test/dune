@@ -1,0 +1,12 @@
+(test
+ (name test_whdr_sub_kit)
+ (libraries
+  whdr_sub_kit
+  alcotest
+  alcotest-lwt
+  lwt
+  lwt.unix
+  unix
+  yojson
+  base64
+  digestif.c))
