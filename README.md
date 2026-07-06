@@ -97,11 +97,31 @@ sudo scripts/install-service.sh \
 
 See [Tunnel Companions](docs/TUNNELS.md) for the security boundary and setup flow.
 
+## Client Libraries
+
+Subscriber-side client libraries implementing the *Subscriber wire protocol v2*
+(connect, auth, subscribe, durable-delivery replay/resume, reconnect) live under
+`clients/`. Each mirrors the Rust reference (`whdr-sub-kit`): a batteries-included
+`run(handler)` reconnect-and-resume loop plus a lower-level typed connection, and
+each ships a 10-point protocol conformance map in its own README.
+
+| Language | Location | Runtime dependency |
+|----------|----------|--------------------|
+| Rust (reference) | [`crates/whdr-sub-kit`](crates/whdr-sub-kit) | `tokio-tungstenite` |
+| TypeScript | [`clients/typescript`](clients/typescript) | `ws` |
+| Go | [`clients/go`](clients/go) | `github.com/coder/websocket` |
+| Python | [`clients/python`](clients/python) | `websockets` |
+| OCaml | [`clients/ocaml`](clients/ocaml) | Lwt (hand-rolled RFC6455) |
+
+See [docs/SUBSCRIBERS.md](docs/SUBSCRIBERS.md) for the quickstart (mint a token,
+enable durable delivery, run a subscriber).
+
 ## Documentation
 
 - [Specification](docs/SPEC.md)
 - [Implementation Plan](docs/PLAN.md)
 - [Operations Guide](docs/OPERATIONS.md)
+- [Subscriber Guide](docs/SUBSCRIBERS.md)
 - [Extension Authoring Guide](docs/EXTENSIONS.md)
 - [Tunnel Companions](docs/TUNNELS.md)
 
