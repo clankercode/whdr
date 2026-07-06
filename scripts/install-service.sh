@@ -13,6 +13,13 @@ dry_run=0
 enable_service=1
 start_service=1
 build_bins=1
+tunnel_provider="none"
+tunnel_service_name="whdr-tunnel-cloudflare"
+tunnel_config_dir="/etc/cloudflared"
+public_host=""
+cloudflare_tunnel=""
+cloudflare_credentials_file=""
+cloudflared_bin="/usr/bin/cloudflared"
 
 usage() {
   cat <<'EOF'
@@ -32,6 +39,14 @@ Options:
   --skip-build              Do not run cargo build first.
   --no-enable               Do not run systemctl enable.
   --no-start                Do not restart the service after install.
+  --tunnel-provider PROVIDER       Optional external tunnel companion: none or cloudflare (default: none).
+  --public-host HOST               Public hostname routed to whdr ingest when using a tunnel.
+  --cloudflare-tunnel NAME         Cloudflare Tunnel name when --tunnel-provider cloudflare.
+  --cloudflare-credentials-file FILE
+                               Cloudflare Tunnel credentials JSON file.
+  --cloudflared-bin FILE           cloudflared binary path (default: /usr/bin/cloudflared).
+  --tunnel-config-dir DIR          Tunnel config directory (default: /etc/cloudflared).
+  --tunnel-service-name NAME       Companion systemd service name (default: whdr-tunnel-cloudflare).
   -h, --help                Show this help.
 
 Default layout:
@@ -56,6 +71,13 @@ while (($#)); do
     --skip-build) build_bins=0 ;;
     --no-enable) enable_service=0 ;;
     --no-start) start_service=0 ;;
+    --tunnel-provider) tunnel_provider="${2:?missing value for --tunnel-provider}"; shift ;;
+    --public-host) public_host="${2:?missing value for --public-host}"; shift ;;
+    --cloudflare-tunnel) cloudflare_tunnel="${2:?missing value for --cloudflare-tunnel}"; shift ;;
+    --cloudflare-credentials-file) cloudflare_credentials_file="${2:?missing value for --cloudflare-credentials-file}"; shift ;;
+    --cloudflared-bin) cloudflared_bin="${2:?missing value for --cloudflared-bin}"; shift ;;
+    --tunnel-config-dir) tunnel_config_dir="${2:?missing value for --tunnel-config-dir}"; shift ;;
+    --tunnel-service-name) tunnel_service_name="${2:?missing value for --tunnel-service-name}"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -72,6 +94,41 @@ profile_flag=()
 if [[ "$profile" == "release" ]]; then
   profile_flag=(--release)
 fi
+
+validate_tunnel_options() {
+  case "$tunnel_provider" in
+    none)
+      return 0
+      ;;
+    cloudflare)
+      if [[ -z "$public_host" ]]; then
+        echo "--public-host is required when --tunnel-provider cloudflare" >&2
+        exit 2
+      fi
+      if [[ -z "$cloudflare_tunnel" ]]; then
+        echo "--cloudflare-tunnel is required when --tunnel-provider cloudflare" >&2
+        exit 2
+      fi
+      if [[ "$cloudflare_tunnel" == */* || "$cloudflare_tunnel" == *..* ]]; then
+        echo "--cloudflare-tunnel must be a name, not a path" >&2
+        exit 2
+      fi
+      if [[ -z "$cloudflare_credentials_file" ]]; then
+        echo "--cloudflare-credentials-file is required when --tunnel-provider cloudflare" >&2
+        exit 2
+      fi
+      ;;
+    *)
+      echo "unsupported --tunnel-provider: $tunnel_provider" >&2
+      exit 2
+      ;;
+  esac
+}
+
+validate_tunnel_options
+
+cloudflare_config_file="${tunnel_config_dir%/}/${cloudflare_tunnel}.yml"
+tunnel_unit_file="${service_dir%/}/${tunnel_service_name}.service"
 
 render_config() {
   cat <<EOF
@@ -134,6 +191,35 @@ WantedBy=multi-user.target
 EOF
 }
 
+render_cloudflare_tunnel_config() {
+  cat <<EOF
+tunnel: $cloudflare_tunnel
+credentials-file: $cloudflare_credentials_file
+
+ingress:
+  - hostname: $public_host
+    service: http://127.0.0.1:8787
+  - service: http_status:404
+EOF
+}
+
+render_cloudflare_tunnel_unit() {
+  cat <<EOF
+[Unit]
+Description=WHDR Cloudflare Tunnel
+After=network-online.target $service_name.service
+Wants=network-online.target
+Requires=$service_name.service
+
+[Service]
+ExecStart=$cloudflared_bin tunnel --config $cloudflare_config_file run $cloudflare_tunnel
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 plan() {
   cat <<EOF
 install whdr-server -> $bindir/whdr-server
@@ -145,12 +231,24 @@ write config -> $config_file
 write secrets -> $secrets_file
 install systemd unit -> $unit_file
 EOF
+  if [[ "$tunnel_provider" == "cloudflare" ]]; then
+    echo "write cloudflare tunnel config -> $cloudflare_config_file"
+    echo "install cloudflare tunnel systemd unit -> $tunnel_unit_file"
+  fi
   echo
   echo "# config.toml"
   render_config
   echo
   echo "# ${service_name}.service"
   render_unit
+  if [[ "$tunnel_provider" == "cloudflare" ]]; then
+    echo
+    echo "# $(basename "$cloudflare_config_file")"
+    render_cloudflare_tunnel_config
+    echo
+    echo "# ${tunnel_service_name}.service"
+    render_cloudflare_tunnel_unit
+  fi
 }
 
 if [[ "$dry_run" == "1" ]]; then
@@ -207,12 +305,32 @@ render_unit > "$tmp"
 install -m 0644 "$tmp" "$unit_file"
 rm -f "$tmp"
 
+if [[ "$tunnel_provider" == "cloudflare" ]]; then
+  install -d -m 0755 "$tunnel_config_dir"
+
+  tmp="$(mktemp)"
+  render_cloudflare_tunnel_config > "$tmp"
+  install -m 0644 "$tmp" "$cloudflare_config_file"
+  rm -f "$tmp"
+
+  tmp="$(mktemp)"
+  render_cloudflare_tunnel_unit > "$tmp"
+  install -m 0644 "$tmp" "$tunnel_unit_file"
+  rm -f "$tmp"
+fi
+
 systemctl daemon-reload
 if [[ "$enable_service" == "1" ]]; then
   systemctl enable "$service_name.service"
+  if [[ "$tunnel_provider" == "cloudflare" ]]; then
+    systemctl enable "$tunnel_service_name.service"
+  fi
 fi
 if [[ "$start_service" == "1" ]]; then
   systemctl restart "$service_name.service"
+  if [[ "$tunnel_provider" == "cloudflare" ]]; then
+    systemctl restart "$tunnel_service_name.service"
+  fi
 fi
 
 cat <<EOF
