@@ -355,20 +355,22 @@ impl ServerHandle {
 
     /// SIGTERM and wait for exit (graceful shutdown path).
     pub async fn stop(&mut self) -> Result<()> {
-        if self.child.is_some() {
-            self.signal("TERM")?;
-            let child = self.child.as_mut().unwrap();
-            if timeout(Duration::from_secs(10), child.wait())
-                .await
-                .is_err()
-            {
-                child.kill().await.ok();
-                bail!(
-                    "server did not exit on SIGTERM; killed. log:\n{}",
-                    self.logs()
-                );
-            }
-            self.child = None;
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(child.id().unwrap_or_default().to_string())
+            .status()?;
+        if timeout(Duration::from_secs(10), child.wait())
+            .await
+            .is_err()
+        {
+            child.kill().await.ok();
+            bail!(
+                "server did not exit on SIGTERM; killed. log:\n{}",
+                self.logs()
+            );
         }
         Ok(())
     }

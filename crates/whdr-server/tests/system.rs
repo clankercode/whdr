@@ -400,9 +400,8 @@ async fn stalled_subscriber_drops_oldest_while_healthy_loses_nothing() {
     // The healthy consumer saw every event, in order.
     let (_fast, fast_got) = fast_reader.await.unwrap();
     assert_eq!(fast_got.len(), EVENTS);
-    let tags: Vec<String> = fast_got.iter().map(|payload| decode_tag(payload)).collect();
-    for n in 0..EVENTS {
-        assert_eq!(tags[n], format!("msg{n:05}"));
+    for (n, payload) in fast_got.iter().enumerate() {
+        assert_eq!(decode_tag(payload), format!("msg{n:05}"));
     }
 
     // The stalled consumer accrued drops (visible in status)…
