@@ -6,7 +6,24 @@
 
 use std::fmt::Write;
 
+use axum::extract::State;
+use axum::response::{IntoResponse, Response};
 use serde_json::Value;
+
+use crate::daemon::AppState;
+
+pub(crate) async fn metrics_handler(State(state): State<AppState>) -> Response {
+    let status = state.status_json().await;
+    let body = render_prometheus(&status);
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
+        .into_response()
+}
 
 pub(crate) fn render_prometheus(status: &Value) -> String {
     let mut out = String::new();

@@ -1,9 +1,6 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::env;
-use std::fs;
 #[cfg(test)]
 use std::net::SocketAddr;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -11,36 +8,29 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use axum::body::Bytes;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{OriginalUri, State};
-use axum::http::header::{AUTHORIZATION, HeaderName, HeaderValue, RETRY_AFTER};
-use axum::http::{HeaderMap, Method, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::http::Method;
 use axum::routing::get;
 use axum::{Router, routing::any};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter, Lines};
-use tokio::net::{TcpListener, UnixListener, UnixStream};
+use tokio::net::TcpListener;
 use tokio::process::{ChildStdin, ChildStdout};
-use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc, oneshot};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
-use whdr_proto::{
-    ClosingReason, ControlRequest, ControlResponse, Event, ExtMsg, HttpReply, SrvMsg, SubClientMsg,
-    SubServerMsg, decode_line, encode_line, validate_channel,
-};
+use whdr_proto::{ClosingReason, Event, ExtMsg, HttpReply, SrvMsg, decode_line, encode_line};
 
+use crate::channel_claims::{filter_owned_events, validate_registration_claims};
 use crate::dispatch_window::{DispatchWait, DispatchWindow};
 use crate::extension_process::{
-    ExtensionProcess, kill_child_wait, spawn_extension_process, wait_for_child_shutdown,
+    ExtensionProcess, discover_extensions, kill_child_wait, spawn_extension_process,
+    wait_for_child_shutdown,
 };
 use crate::extension_registration::read_registration;
-use crate::outbound_queue::OutboundQueue;
-use crate::subscribers::{SubscriberRegistration, SubscriberRegistry, now_unix_ms};
+use crate::subscribers::{SubscriberRegistry, now_unix_ms};
 use crate::token_control::TokenControl;
 use crate::{Config, TokenStore};
 
@@ -85,9 +75,9 @@ struct ExtHandle {
     pid: Option<u32>,
 }
 
-struct ExtResult {
-    http: HttpReply,
-    events: Vec<Event>,
+pub(crate) struct ExtResult {
+    pub(crate) http: HttpReply,
+    pub(crate) events: Vec<Event>,
 }
 
 /// Event-emission stats per extension. `last_event_at_ms` makes silent
@@ -135,19 +125,12 @@ struct SupervisorState {
 }
 
 #[derive(Debug)]
-enum DispatchError {
+pub(crate) enum DispatchError {
     Busy,
     Starting,
     Timeout,
     Dead,
     NotFound,
-}
-
-pub fn route_key_from_path(path: &str) -> Option<String> {
-    path.trim_start_matches('/')
-        .split('/')
-        .find(|segment| !segment.is_empty())
-        .map(str::to_string)
 }
 
 impl AppState {
@@ -171,8 +154,22 @@ impl AppState {
         })
     }
 
-    fn token_control(&self) -> TokenControl<'_> {
+    pub(crate) fn token_control(&self) -> TokenControl<'_> {
         TokenControl::new(&self.inner.token_store, &self.inner.subscribers)
+    }
+
+    /// Snapshot of the current config for edge handlers.
+    pub(crate) async fn config(&self) -> Config {
+        self.inner.config.read().await.clone()
+    }
+
+    pub(crate) fn subscribers(&self) -> &SubscriberRegistry {
+        &self.inner.subscribers
+    }
+
+    /// Resolve a presented bearer token to its subscriber name.
+    pub(crate) async fn authenticate_subscriber(&self, token: &str) -> Option<String> {
+        self.inner.token_store.read().await.authenticate(token)
     }
 
     pub async fn start_extensions(&self) -> Result<()> {
@@ -366,7 +363,7 @@ impl AppState {
         Ok(())
     }
 
-    async fn dispatch(
+    pub(crate) async fn dispatch(
         &self,
         route_key: &str,
         method: Method,
@@ -617,7 +614,7 @@ impl AppState {
         Some(Duration::from_millis(delay_ms))
     }
 
-    async fn status_json(&self) -> Value {
+    pub(crate) async fn status_json(&self) -> Value {
         let extensions = self.inner.extensions.read().await;
         let failed = self.inner.failed_extensions.read().await;
         let mut ext_rows = Vec::new();
@@ -1067,10 +1064,10 @@ async fn start_servers(state: AppState) -> Result<RunningServers> {
         .local_addr()
         .context("read subscriber listener address")?;
     let ingest_router = Router::new()
-        .fallback(any(ingest_handler))
+        .fallback(any(crate::ingest::ingest_handler))
         .with_state(state.clone());
     let sub_router = Router::new()
-        .route("/subscribe", get(subscribe_handler))
+        .route("/subscribe", get(crate::subscriber_ws::subscribe_handler))
         .with_state(state.clone());
 
     let mut metrics_task = None;
@@ -1089,7 +1086,7 @@ async fn start_servers(state: AppState) -> Result<RunningServers> {
             );
         }
         let metrics_router = Router::new()
-            .route("/metrics", get(metrics_handler))
+            .route("/metrics", get(crate::metrics::metrics_handler))
             .with_state(state.clone());
         metrics_task = Some(tokio::spawn(async move {
             axum::serve(metrics_listener, metrics_router).await
@@ -1099,7 +1096,10 @@ async fn start_servers(state: AppState) -> Result<RunningServers> {
     let ingest_task =
         tokio::spawn(async move { axum::serve(ingest_listener, ingest_router).await });
     let sub_task = tokio::spawn(async move { axum::serve(sub_listener, sub_router).await });
-    let control_task = tokio::spawn(control_loop(state.clone(), control_socket));
+    let control_task = tokio::spawn(crate::control_plane::control_loop(
+        state.clone(),
+        control_socket,
+    ));
     Ok(RunningServers {
         #[cfg(test)]
         sub_addr: bound_sub_addr,
@@ -1110,19 +1110,6 @@ async fn start_servers(state: AppState) -> Result<RunningServers> {
         metrics_task,
         control_task,
     })
-}
-
-async fn metrics_handler(State(state): State<AppState>) -> Response {
-    let status = state.status_json().await;
-    let body = crate::metrics::render_prometheus(&status);
-    (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/plain; version=0.0.4",
-        )],
-        body,
-    )
-        .into_response()
 }
 
 async fn shutdown_state(state: &AppState, servers: RunningServers) {
@@ -1155,245 +1142,6 @@ async fn reload_from_path(state: &AppState, config_path: &Path) -> Result<()> {
     }
     state.start_extensions().await?;
     Ok(())
-}
-
-async fn ingest_handler(
-    State(state): State<AppState>,
-    OriginalUri(uri): OriginalUri,
-    method: Method,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let config = state.inner.config.read().await.clone();
-    if body.len() > config.limits.max_body_bytes {
-        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-    }
-    let Some(route_key) = route_key_from_path(uri.path()) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let headers = header_map_to_btree(&headers);
-    let query = uri.query().map(ToString::to_string);
-    match state
-        .dispatch(
-            &route_key,
-            method,
-            uri.path().to_string(),
-            query,
-            headers,
-            body,
-        )
-        .await
-    {
-        Ok(result) => http_reply_to_response(result.http),
-        Err(DispatchError::Busy) => StatusCode::TOO_MANY_REQUESTS.into_response(),
-        Err(DispatchError::Starting) => {
-            let mut response = StatusCode::SERVICE_UNAVAILABLE.into_response();
-            response
-                .headers_mut()
-                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
-            response
-        }
-        Err(DispatchError::Timeout) => StatusCode::GATEWAY_TIMEOUT.into_response(),
-        Err(DispatchError::Dead) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        Err(DispatchError::NotFound) => StatusCode::NOT_FOUND.into_response(),
-    }
-}
-
-async fn subscribe_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> Response {
-    let token = headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::to_string);
-    let Some(token) = token else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    let name = {
-        let store = state.inner.token_store.read().await;
-        store.authenticate(&token)
-    };
-    let Some(name) = name else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    ws.on_upgrade(move |socket| subscriber_socket(state, name, socket))
-        .into_response()
-}
-
-async fn subscriber_socket(state: AppState, name: String, socket: WebSocket) {
-    let config = state.inner.config.read().await.clone();
-    let ws_idle_timeout = Duration::from_millis(config.subscribers.ws_idle_timeout_ms.max(1));
-    let queue = Arc::new(OutboundQueue::new(
-        config.limits.sub_queue_len,
-        config.limits.sub_queue_bytes,
-    ));
-    let (close_tx, mut close_rx) = watch::channel::<Option<ClosingReason>>(None);
-    let id = state
-        .inner
-        .subscribers
-        .insert(SubscriberRegistration {
-            name: name.clone(),
-            remote_addr: None,
-            queue: queue.clone(),
-            close_tx,
-        })
-        .await;
-
-    let (mut sink, mut stream) = socket.split();
-    let _ = sink
-        .send(Message::Text(
-            serde_json::to_string(&SubServerMsg::Welcome { name })
-                .unwrap()
-                .into(),
-        ))
-        .await;
-
-    let mut ping_interval = time::interval(ws_idle_timeout);
-    ping_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-    ping_interval.tick().await;
-    let mut awaiting_pong = false;
-
-    loop {
-        tokio::select! {
-            _ = ping_interval.tick() => {
-                if awaiting_pong {
-                    warn!(subscriber = id, "subscriber missed websocket pong; closing");
-                    break;
-                }
-                if sink.send(Message::Ping(Bytes::new())).await.is_err() {
-                    break;
-                }
-                awaiting_pong = true;
-            }
-            frame = queue.pop() => {
-                if sink.send(Message::Text(frame.text.to_string().into())).await.is_err() {
-                    break;
-                }
-                if frame.closing {
-                    break;
-                }
-            }
-            changed = close_rx.changed() => {
-                if changed.is_err() {
-                    break;
-                }
-                let Some(reason) = close_rx.borrow().clone() else {
-                    continue;
-                };
-                if let Ok(text) = serde_json::to_string(&SubServerMsg::Closing { reason }) {
-                    let _ = sink.send(Message::Text(text.into())).await;
-                }
-                break;
-            }
-            incoming = stream.next() => {
-                match incoming {
-                    Some(Ok(Message::Text(text))) => {
-                        if handle_subscriber_text(&state, id, text.as_str(), &queue).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Ok(Message::Ping(payload))) => {
-                        let _ = sink.send(Message::Pong(payload)).await;
-                    }
-                    Some(Ok(Message::Pong(_))) => {
-                        awaiting_pong = false;
-                    }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(_)) => {}
-                    Some(Err(_)) => break,
-                }
-            }
-        }
-    }
-
-    state.inner.subscribers.remove(id).await;
-}
-
-async fn handle_subscriber_text(
-    state: &AppState,
-    id: u64,
-    text: &str,
-    queue: &OutboundQueue,
-) -> Result<()> {
-    let msg: SubClientMsg = serde_json::from_str(text)?;
-    match msg {
-        SubClientMsg::Subscribe { patterns } => {
-            if let Err(msg) = state.inner.subscribers.subscribe(id, patterns).await {
-                queue.push_control(&SubServerMsg::Error {
-                    op: "subscribe".to_string(),
-                    msg,
-                });
-                return Ok(());
-            }
-            queue.push_control(&SubServerMsg::Ok {
-                op: "subscribe".to_string(),
-            });
-        }
-        SubClientMsg::Unsubscribe { patterns } => {
-            state.inner.subscribers.unsubscribe(id, &patterns).await;
-            queue.push_control(&SubServerMsg::Ok {
-                op: "unsubscribe".to_string(),
-            });
-        }
-        SubClientMsg::Ping => {
-            queue.push_control(&SubServerMsg::Pong);
-        }
-    }
-    Ok(())
-}
-
-async fn control_loop(state: AppState, path: PathBuf) -> Result<()> {
-    if path.exists() {
-        fs::remove_file(&path).with_context(|| format!("remove old {}", path.display()))?;
-    }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let listener = UnixListener::bind(&path).with_context(|| format!("bind {}", path.display()))?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o660))
-        .with_context(|| format!("chmod {}", path.display()))?;
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let state = state.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_control_stream(state, stream).await {
-                debug!(error = %err, "control stream ended");
-            }
-        });
-    }
-}
-
-async fn handle_control_stream(state: AppState, stream: UnixStream) -> Result<()> {
-    let (read, write) = stream.into_split();
-    let mut lines = BufReader::new(read).lines();
-    let mut writer = BufWriter::new(write);
-    while let Some(line) = lines.next_line().await? {
-        let response = match decode_line::<ControlRequest>(&line) {
-            Ok(Some(request)) => handle_control_request(&state, request).await,
-            Ok(None) => continue,
-            Err(err) => ControlResponse::Error {
-                msg: err.to_string(),
-            },
-        };
-        writer.write_all(encode_line(&response)?.as_bytes()).await?;
-        writer.flush().await?;
-    }
-    Ok(())
-}
-
-async fn handle_control_request(state: &AppState, request: ControlRequest) -> ControlResponse {
-    match request {
-        ControlRequest::Status => ControlResponse::Status {
-            status: state.status_json().await,
-        },
-        ControlRequest::TokenAdd { name } => state.token_control().add(name).await,
-        ControlRequest::TokenRotate { name } => state.token_control().rotate(name).await,
-        ControlRequest::TokenRevoke { name } => state.token_control().revoke(name).await,
-        ControlRequest::TokenList => state.token_control().list().await,
-    }
 }
 
 async fn send_shutdown_to_subscribers(state: &AppState) {
@@ -1441,191 +1189,16 @@ async fn send_shutdown_to_extensions(state: &AppState) {
     }
 }
 
-fn header_map_to_btree(headers: &HeaderMap) -> BTreeMap<String, String> {
-    headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
-        })
-        .collect()
-}
-
-fn http_reply_to_response(reply: HttpReply) -> Response {
-    let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let mut response = (status, reply.body).into_response();
-    for (name, value) in reply.headers {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(&value),
-        ) {
-            response.headers_mut().insert(name, value);
-        }
-    }
-    response
-}
-
-fn filter_owned_events(
-    ext_id: &str,
-    paths: &[String],
-    registered_prefixes: &[String],
-    violations: &AtomicUsize,
-    events: Vec<Event>,
-) -> Vec<Event> {
-    events
-        .into_iter()
-        .filter_map(|event| {
-            match validate_emitted_channel(&event.channel, ext_id, paths, registered_prefixes) {
-                Ok(()) => Some(event),
-                Err(err) => {
-                    let count = violations.fetch_add(1, Ordering::Relaxed) + 1;
-                    warn!(
-                        ext = ext_id,
-                        channel = event.channel,
-                        count,
-                        error = %err,
-                        "extension emitted unauthorized channel"
-                    );
-                    None
-                }
-            }
-        })
-        .collect()
-}
-
-fn validate_registration_claims(
-    id: &str,
-    claims: &[String],
-    channel_prefixes: &[String],
-    routes: &HashMap<String, String>,
-    existing_prefixes: &HashMap<String, String>,
-) -> Result<()> {
-    let mut seen_claims = HashMap::new();
-    for claim in claims {
-        validate_path_claim(claim)?;
-        if seen_claims.insert(claim.as_str(), ()).is_some() {
-            bail!("duplicate path claim: {claim}");
-        }
-        if let Some(owner) = routes.get(claim) {
-            bail!("path collision: {claim} already claimed by {owner}");
-        }
-        for (prefix, owner) in existing_prefixes {
-            if owner != id && first_channel_segment(prefix) == claim {
-                bail!("path claim {claim} collides with channel prefix {prefix} owned by {owner}");
-            }
-        }
-    }
-
-    let mut seen_prefixes: Vec<&str> = Vec::new();
-    for prefix in channel_prefixes {
-        validate_channel(prefix).with_context(|| format!("invalid channel prefix: {prefix}"))?;
-        for seen in &seen_prefixes {
-            if channel_prefixes_overlap(prefix, seen) {
-                bail!("channel prefix {prefix} collides with channel prefix {seen}");
-            }
-        }
-        seen_prefixes.push(prefix.as_str());
-
-        let first = first_channel_segment(prefix);
-        if let Some(owner) = routes.get(first)
-            && owner != id
-        {
-            bail!("channel prefix {prefix} collides with route {first} owned by {owner}");
-        }
-        for (existing, owner) in existing_prefixes {
-            if owner != id && channel_prefixes_overlap(prefix, existing) {
-                bail!(
-                    "channel prefix {prefix} collides with channel prefix {existing} owned by {owner}"
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_emitted_channel(
-    channel: &str,
-    ext_id: &str,
-    claims: &[String],
-    registered_prefixes: &[String],
-) -> Result<()> {
-    validate_channel(channel).with_context(|| format!("invalid event channel: {channel}"))?;
-    let first = first_channel_segment(channel);
-    if claims.iter().any(|claim| claim == first)
-        || registered_prefixes
-            .iter()
-            .any(|prefix| channel_is_in_prefix(channel, prefix))
-    {
-        return Ok(());
-    }
-    bail!("channel {channel} is not owned by extension {ext_id}");
-}
-
-fn first_channel_segment(channel: &str) -> &str {
-    channel.split('.').next().unwrap_or_default()
-}
-
-fn channel_is_in_prefix(channel: &str, prefix: &str) -> bool {
-    channel == prefix
-        || channel
-            .strip_prefix(prefix)
-            .is_some_and(|suffix| suffix.starts_with('.'))
-}
-
-fn channel_prefixes_overlap(left: &str, right: &str) -> bool {
-    channel_is_in_prefix(left, right) || channel_is_in_prefix(right, left)
-}
-
-fn discover_extensions() -> Result<Vec<(String, PathBuf)>> {
-    let mut found = HashMap::new();
-    let Some(path_var) = env::var_os("PATH") else {
-        return Ok(Vec::new());
-    };
-    for dir in env::split_paths(&path_var) {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let Some(file_name) = file_name.to_str() else {
-                continue;
-            };
-            let Some(id) = file_name.strip_prefix("whdr-ext-") else {
-                continue;
-            };
-            if id.is_empty() || !is_executable(&entry.path()) {
-                continue;
-            }
-            found.entry(id.to_string()).or_insert(entry.path());
-        }
-    }
-    Ok(found.into_iter().collect())
-}
-
-fn is_executable(path: &Path) -> bool {
-    fs::metadata(path)
-        .map(|meta| meta.is_file() && (meta.permissions().mode() & 0o111 != 0))
-        .unwrap_or(false)
-}
-
-fn validate_path_claim(claim: &str) -> Result<()> {
-    if claim.is_empty()
-        || claim.contains('/')
-        || !claim
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
-    {
-        bail!("invalid path claim: {claim}");
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::os::unix::fs::PermissionsExt;
+
+    use axum::http::HeaderValue;
+    use axum::http::header::AUTHORIZATION;
+    use futures_util::StreamExt;
 
     use crate::{ExtensionsConfig, LimitsConfig, ServerConfig, SubscribersConfig, TimeoutsConfig};
     use tokio::sync::Barrier;
@@ -2211,63 +1784,6 @@ sleep 5
         assert!(
             err.to_string()
                 .contains("refusing non-loopback subscriber bind")
-        );
-    }
-
-    #[test]
-    fn registration_rejects_channel_prefix_that_collides_with_existing_route() {
-        let mut routes = HashMap::new();
-        routes.insert("github".to_string(), "github".to_string());
-        let prefixes = HashMap::new();
-
-        let err = validate_registration_claims(
-            "teams",
-            &["teams".to_string()],
-            &["github.notifications".to_string()],
-            &routes,
-            &prefixes,
-        )
-        .unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("channel prefix github.notifications collides with route github")
-        );
-    }
-
-    #[test]
-    fn emitted_event_channel_must_be_valid_and_owned() {
-        let registered_prefixes = vec!["alerts.ops".to_string()];
-
-        assert!(
-            validate_emitted_channel(
-                "teams.message",
-                "teams",
-                &["teams".to_string()],
-                &registered_prefixes
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_emitted_channel(
-                "alerts.ops.high",
-                "teams",
-                &["teams".to_string()],
-                &registered_prefixes
-            )
-            .is_ok()
-        );
-
-        let err = validate_emitted_channel(
-            "github.push",
-            "teams",
-            &["teams".to_string()],
-            &registered_prefixes,
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("channel github.push is not owned by extension teams")
         );
     }
 }

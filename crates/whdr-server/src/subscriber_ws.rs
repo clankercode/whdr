@@ -1,0 +1,165 @@
+//! Subscriber WebSocket plane: bearer-token handshake, per-connection
+//! outbound queue, app-level subscribe/unsubscribe/ping, and WS-ping
+//! liveness (SPEC §9).
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::http::HeaderMap;
+use axum::http::StatusCode;
+use axum::http::header::AUTHORIZATION;
+use axum::response::{IntoResponse, Response};
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::watch;
+use tokio::time;
+use tracing::warn;
+use whdr_proto::{ClosingReason, SubClientMsg, SubServerMsg};
+
+use crate::daemon::AppState;
+use crate::outbound_queue::OutboundQueue;
+use crate::subscribers::SubscriberRegistration;
+
+pub(crate) async fn subscribe_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let token = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_string);
+    let Some(token) = token else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(name) = state.authenticate_subscriber(&token).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    ws.on_upgrade(move |socket| subscriber_socket(state, name, socket))
+        .into_response()
+}
+
+async fn subscriber_socket(state: AppState, name: String, socket: WebSocket) {
+    let config = state.config().await;
+    let ws_idle_timeout = Duration::from_millis(config.subscribers.ws_idle_timeout_ms.max(1));
+    let queue = Arc::new(OutboundQueue::new(
+        config.limits.sub_queue_len,
+        config.limits.sub_queue_bytes,
+    ));
+    let (close_tx, mut close_rx) = watch::channel::<Option<ClosingReason>>(None);
+    let id = state
+        .subscribers()
+        .insert(SubscriberRegistration {
+            name: name.clone(),
+            remote_addr: None,
+            queue: queue.clone(),
+            close_tx,
+        })
+        .await;
+
+    let (mut sink, mut stream) = socket.split();
+    let _ = sink
+        .send(Message::Text(
+            serde_json::to_string(&SubServerMsg::Welcome { name })
+                .unwrap()
+                .into(),
+        ))
+        .await;
+
+    let mut ping_interval = time::interval(ws_idle_timeout);
+    ping_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    ping_interval.tick().await;
+    let mut awaiting_pong = false;
+
+    loop {
+        tokio::select! {
+            _ = ping_interval.tick() => {
+                if awaiting_pong {
+                    warn!(subscriber = id, "subscriber missed websocket pong; closing");
+                    break;
+                }
+                if sink.send(Message::Ping(Bytes::new())).await.is_err() {
+                    break;
+                }
+                awaiting_pong = true;
+            }
+            frame = queue.pop() => {
+                if sink.send(Message::Text(frame.text.to_string().into())).await.is_err() {
+                    break;
+                }
+                if frame.closing {
+                    break;
+                }
+            }
+            changed = close_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let Some(reason) = close_rx.borrow().clone() else {
+                    continue;
+                };
+                if let Ok(text) = serde_json::to_string(&SubServerMsg::Closing { reason }) {
+                    let _ = sink.send(Message::Text(text.into())).await;
+                }
+                break;
+            }
+            incoming = stream.next() => {
+                match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        if handle_subscriber_text(&state, id, text.as_str(), &queue).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        let _ = sink.send(Message::Pong(payload)).await;
+                    }
+                    Some(Ok(Message::Pong(_))) => {
+                        awaiting_pong = false;
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => break,
+                }
+            }
+        }
+    }
+
+    state.subscribers().remove(id).await;
+}
+
+async fn handle_subscriber_text(
+    state: &AppState,
+    id: u64,
+    text: &str,
+    queue: &OutboundQueue,
+) -> Result<()> {
+    let msg: SubClientMsg = serde_json::from_str(text)?;
+    match msg {
+        SubClientMsg::Subscribe { patterns } => {
+            if let Err(msg) = state.subscribers().subscribe(id, patterns).await {
+                queue.push_control(&SubServerMsg::Error {
+                    op: "subscribe".to_string(),
+                    msg,
+                });
+                return Ok(());
+            }
+            queue.push_control(&SubServerMsg::Ok {
+                op: "subscribe".to_string(),
+            });
+        }
+        SubClientMsg::Unsubscribe { patterns } => {
+            state.subscribers().unsubscribe(id, &patterns).await;
+            queue.push_control(&SubServerMsg::Ok {
+                op: "unsubscribe".to_string(),
+            });
+        }
+        SubClientMsg::Ping => {
+            queue.push_control(&SubServerMsg::Pong);
+        }
+    }
+    Ok(())
+}

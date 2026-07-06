@@ -1,15 +1,48 @@
-use std::path::Path;
+use std::env;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
-
-#[cfg(test)]
-use std::fs;
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time;
 use tracing::{debug, warn};
+
+/// Scan PATH for `whdr-ext-*` executables; the suffix is the candidate id.
+pub(crate) fn discover_extensions() -> Result<Vec<(String, PathBuf)>> {
+    let mut found = std::collections::HashMap::new();
+    let Some(path_var) = env::var_os("PATH") else {
+        return Ok(Vec::new());
+    };
+    for dir in env::split_paths(&path_var) {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            let Some(id) = file_name.strip_prefix("whdr-ext-") else {
+                continue;
+            };
+            if id.is_empty() || !is_executable(&entry.path()) {
+                continue;
+            }
+            found.entry(id.to_string()).or_insert(entry.path());
+        }
+    }
+    Ok(found.into_iter().collect())
+}
+
+fn is_executable(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|meta| meta.is_file() && (meta.permissions().mode() & 0o111 != 0))
+        .unwrap_or(false)
+}
 
 pub(crate) struct ExtensionProcess {
     pub(crate) child: Child,
