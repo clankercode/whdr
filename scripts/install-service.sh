@@ -248,6 +248,7 @@ install whdr -> $bindir/whdr
 install whdr-ext-dev -> $bindir/whdr-ext-dev
 install whdr-ext-github -> $bindir/whdr-ext-github
 install whdr-ext-teams -> $bindir/whdr-ext-teams
+install whdr-ext-hmac -> $bindir/whdr-ext-hmac
 write config -> $config_file
 write secrets -> $secrets_file
 install systemd unit -> $unit_file
@@ -297,7 +298,7 @@ install -d -m 0755 "$bindir"
 install -d -m 0755 "$config_dir"
 install -d -m 0750 -o "$user" -g "$group" "$state_dir"
 
-for bin in whdr-server whdr whdr-ext-dev whdr-ext-github whdr-ext-teams; do
+for bin in whdr-server whdr whdr-ext-dev whdr-ext-github whdr-ext-teams whdr-ext-hmac; do
   install -m 0755 "$target_dir/$bin" "$bindir/$bin"
 done
 
