@@ -1756,6 +1756,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "whdr-ext-hmac"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "hex",
+ "hmac",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "subtle",
+ "tokio",
+ "uuid",
+ "whdr-ext-kit",
+ "whdr-proto",
+]
+
+[[package]]
 name = "whdr-ext-kit"
 version = "0.1.0"
 dependencies = [

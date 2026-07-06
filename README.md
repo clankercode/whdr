@@ -11,6 +11,7 @@ whdr is a single-node Webhook Dynamic Router. It accepts provider webhooks over 
 - `whdr-ext-dev`: development echo extension.
 - `whdr-ext-github`: GitHub webhook extension.
 - `whdr-ext-teams`: Microsoft Teams/Graph webhook extension.
+- `whdr-ext-hmac`: generic HMAC signature-verification webhook extension (any provider).
 
 ## Quick Start
 
