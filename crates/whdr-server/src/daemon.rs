@@ -24,6 +24,7 @@ use uuid::Uuid;
 use whdr_proto::{ClosingReason, Event, ExtMsg, HttpReply, SrvMsg, decode_line, encode_line};
 
 use crate::channel_claims::{filter_owned_events, validate_registration_claims};
+use crate::delivery_log::DeliveryLog;
 use crate::dispatch_window::{DispatchWait, DispatchWindow};
 use crate::extension_process::{
     ExtensionProcess, discover_extensions, kill_child_wait, spawn_extension_process,
@@ -137,6 +138,12 @@ impl AppState {
     pub async fn new(config: Config) -> Result<Self> {
         config.validate()?;
         let token_store = TokenStore::load_or_empty(config.token_store_path())?;
+        let subscribers = if config.delivery.enabled {
+            let log = Arc::new(DeliveryLog::open(&config.delivery)?);
+            SubscriberRegistry::with_delivery(log)
+        } else {
+            SubscriberRegistry::new()
+        };
         Ok(Self {
             inner: Arc::new(Inner {
                 config: RwLock::new(config),
@@ -146,7 +153,7 @@ impl AppState {
                 channel_prefixes: RwLock::new(HashMap::new()),
                 extensions: RwLock::new(HashMap::new()),
                 failed_extensions: RwLock::new(HashMap::new()),
-                subscribers: SubscriberRegistry::new(),
+                subscribers,
                 supervisor: AsyncMutex::new(HashMap::new()),
                 shutting_down: AtomicBool::new(false),
                 started: Instant::now(),
@@ -165,6 +172,11 @@ impl AppState {
 
     pub(crate) fn subscribers(&self) -> &SubscriberRegistry {
         &self.inner.subscribers
+    }
+
+    /// The durable delivery log, if `[delivery] enabled`.
+    pub(crate) fn delivery(&self) -> Option<Arc<DeliveryLog>> {
+        self.inner.subscribers.delivery().cloned()
     }
 
     /// Resolve a presented bearer token to its subscriber name.
@@ -1046,6 +1058,7 @@ struct RunningServers {
     sub_task: tokio::task::JoinHandle<std::io::Result<()>>,
     metrics_task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     control_task: tokio::task::JoinHandle<Result<()>>,
+    prune_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 async fn start_servers(state: AppState) -> Result<RunningServers> {
@@ -1093,6 +1106,26 @@ async fn start_servers(state: AppState) -> Result<RunningServers> {
         }));
     }
 
+    let prune_task = state.delivery().map(|log| {
+        let interval_secs = config.delivery.prune_interval_secs.max(1);
+        tokio::spawn(async move {
+            let mut ticker = time::interval(Duration::from_secs(interval_secs));
+            ticker.tick().await; // consume the immediate first tick
+            loop {
+                ticker.tick().await;
+                let log = log.clone();
+                match tokio::task::spawn_blocking(move || log.prune(now_unix_ms())).await {
+                    Ok(Ok(pruned)) if pruned > 0 => {
+                        debug!(pruned, "delivery log pruned")
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(err)) => warn!(error = %err, "delivery log prune failed"),
+                    Err(err) => warn!(error = %err, "delivery prune task failed"),
+                }
+            }
+        })
+    });
+
     let ingest_task =
         tokio::spawn(async move { axum::serve(ingest_listener, ingest_router).await });
     let sub_task = tokio::spawn(async move { axum::serve(sub_listener, sub_router).await });
@@ -1109,6 +1142,7 @@ async fn start_servers(state: AppState) -> Result<RunningServers> {
         sub_task,
         metrics_task,
         control_task,
+        prune_task,
     })
 }
 
@@ -1120,6 +1154,9 @@ async fn shutdown_state(state: &AppState, servers: RunningServers) {
     servers.sub_task.abort();
     if let Some(metrics_task) = servers.metrics_task {
         metrics_task.abort();
+    }
+    if let Some(prune_task) = servers.prune_task {
+        prune_task.abort();
     }
     servers.control_task.abort();
 }

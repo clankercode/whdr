@@ -7,6 +7,7 @@ use tokio::sync::{RwLock, watch};
 use uuid::Uuid;
 use whdr_proto::{ClosingReason, Event, Pattern, SubServerMsg, validate_pattern};
 
+use crate::delivery_log::DeliveryLog;
 use crate::outbound_queue::OutboundQueue;
 
 pub(crate) fn now_unix_ms() -> u64 {
@@ -22,6 +23,22 @@ pub(crate) struct SubscriberRegistry {
     /// In-process global event sequence for the live (non-durable) path.
     /// When durable delivery is enabled the log owns seq allocation instead.
     seq: AtomicU64,
+    /// Durable delivery log (`[delivery] enabled = true`) or `None` for the
+    /// fire-and-forget path.
+    delivery: Option<Arc<DeliveryLog>>,
+    /// Count of fan-out batches that failed to persist and fell back to
+    /// best-effort delivery. Surfaced in status/metrics (§13).
+    persist_errors: AtomicU64,
+}
+
+/// An event stamped with its identity/sequence, ready to serialize into a
+/// live frame. Produced either from the durable log or the in-memory counter.
+struct StampedFrame {
+    seq: u64,
+    id: Uuid,
+    ts_ms: u64,
+    channel: String,
+    payload_b64: String,
 }
 
 pub(crate) struct SubscriberRegistration {
@@ -53,7 +70,27 @@ impl SubscriberRegistry {
             subscribers: RwLock::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             seq: AtomicU64::new(0),
+            delivery: None,
+            persist_errors: AtomicU64::new(0),
         }
+    }
+
+    /// Build a registry backed by a durable delivery log.
+    pub(crate) fn with_delivery(log: Arc<DeliveryLog>) -> Self {
+        Self {
+            delivery: Some(log),
+            ..Self::new()
+        }
+    }
+
+    /// The durable delivery log, if enabled (for replay + status).
+    pub(crate) fn delivery(&self) -> Option<&Arc<DeliveryLog>> {
+        self.delivery.as_ref()
+    }
+
+    /// Count of fan-out batches that failed to persist (best-effort fallback).
+    pub(crate) fn persist_errors(&self) -> u64 {
+        self.persist_errors.load(Ordering::Relaxed)
     }
 
     pub(crate) async fn insert(&self, registration: SubscriberRegistration) -> u64 {
@@ -113,18 +150,44 @@ impl SubscriberRegistry {
         if events.is_empty() {
             return;
         }
+        // Persist-before-deliver under the durable path: an event is committed
+        // to the log (durable, gapless seq) before any frame is queued. A disk
+        // error degrades to best-effort delivery for that batch, never blocks.
+        let frames = match &self.delivery {
+            Some(log) => {
+                let ts_ms = now_unix_ms();
+                let fallback = events.clone();
+                match log.append(events, ts_ms).await {
+                    Ok(stamped) => stamped
+                        .into_iter()
+                        .map(|event| StampedFrame {
+                            seq: event.seq,
+                            id: event.id,
+                            ts_ms: event.ts_ms,
+                            channel: event.channel,
+                            payload_b64: event.payload_b64,
+                        })
+                        .collect(),
+                    Err(err) => {
+                        self.persist_errors.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(error = %err, "delivery append failed; delivering without persistence");
+                        self.stamp_in_memory(fallback)
+                    }
+                }
+            }
+            None => self.stamp_in_memory(events),
+        };
+
         let subscribers = self.subscribers.read().await;
-        for event in events {
-            // The server stamps identity/time/seq once per event, so every
+        for frame in frames {
+            // The frame is serialized once and shared across all queues; every
             // subscriber sees the same id/seq — the replay/dedup key.
-            // The frame is serialized once and shared across all queues.
-            let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
             let msg = SubServerMsg::Event {
-                id: Uuid::new_v4(),
-                seq,
-                ts_ms: now_unix_ms(),
-                channel: event.channel.clone(),
-                payload_b64: event.payload_b64,
+                id: frame.id,
+                seq: frame.seq,
+                ts_ms: frame.ts_ms,
+                channel: frame.channel.clone(),
+                payload_b64: frame.payload_b64,
             };
             let Ok(text) = serde_json::to_string(&msg) else {
                 continue;
@@ -134,13 +197,31 @@ impl SubscriberRegistry {
                 let matches = subscriber
                     .patterns
                     .iter()
-                    .any(|pattern| pattern.matches(&event.channel).unwrap_or(false));
+                    .any(|pattern| pattern.matches(&frame.channel).unwrap_or(false));
                 if !matches {
                     continue;
                 }
                 subscriber.queue.push_event(text.clone());
             }
         }
+    }
+
+    /// Stamp a batch with in-process seq/id/ts (the non-durable path).
+    fn stamp_in_memory(&self, events: Vec<Event>) -> Vec<StampedFrame> {
+        let ts_ms = now_unix_ms();
+        events
+            .into_iter()
+            .map(|event| {
+                let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+                StampedFrame {
+                    seq,
+                    id: Uuid::new_v4(),
+                    ts_ms,
+                    channel: event.channel,
+                    payload_b64: event.payload_b64,
+                }
+            })
+            .collect()
     }
 
     pub(crate) async fn close_named(&self, name: &str, reason: ClosingReason) {
@@ -217,6 +298,17 @@ mod tests {
         }
     }
 
+    fn test_delivery_cfg(dir: &std::path::Path) -> crate::config::DeliveryConfig {
+        crate::config::DeliveryConfig {
+            enabled: true,
+            store_path: dir.join("d.redb"),
+            retention_secs: 86_400,
+            max_bytes: 1 << 30,
+            max_events: 1_000_000,
+            prune_interval_secs: 300,
+        }
+    }
+
     fn decode(frame: &crate::outbound_queue::Frame) -> SubServerMsg {
         serde_json::from_str(&frame.text).expect("queued frame is valid json")
     }
@@ -264,6 +356,32 @@ mod tests {
         let snapshots = registry.snapshots().await;
         assert_eq!(snapshots[0].delivered, 1);
         assert_eq!(snapshots[0].dropped, 1);
+    }
+
+    #[tokio::test]
+    async fn fanout_persists_when_delivery_enabled_and_resumes_seq() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = std::sync::Arc::new(
+            crate::delivery_log::DeliveryLog::open(&test_delivery_cfg(temp.path())).unwrap(),
+        );
+        let registry = SubscriberRegistry::with_delivery(log.clone());
+        let queue = Arc::new(OutboundQueue::new(8, 65_536));
+        let id = insert_subscriber(&registry, "p", queue.clone()).await;
+        registry
+            .subscribe(id, vec!["dev.>".to_string()])
+            .await
+            .unwrap();
+
+        registry.fanout(vec![event("dev.one", "MQ==")]).await;
+
+        // Persisted with the same seq that was delivered.
+        let delivered_seq = match decode(&queue.pop().await) {
+            SubServerMsg::Event { seq, .. } => seq,
+            other => panic!("{other:?}"),
+        };
+        let stored = log.read_after(0, None).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].seq, delivered_seq);
     }
 
     #[tokio::test]
