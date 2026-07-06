@@ -40,6 +40,49 @@ file = "{}"
 }
 
 #[test]
+fn config_delivery_defaults_off_and_parses_overrides() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("whdr.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"
+[server]
+control_socket = "{}"
+
+[delivery]
+enabled = true
+store_path = "{}"
+retention_secs = 3600
+max_events = 500
+"#,
+            temp.path().join("ctl.sock").display(),
+            temp.path().join("delivery.redb").display(),
+        ),
+    )
+    .unwrap();
+
+    let loaded = Config::load(&config).unwrap();
+    assert!(loaded.delivery.enabled);
+    assert_eq!(loaded.delivery.retention_secs, 3600);
+    assert_eq!(loaded.delivery.max_events, 500);
+    // Untouched key keeps its default.
+    assert_eq!(loaded.delivery.max_bytes, 536_870_912);
+
+    // Absent section => disabled by default.
+    let bare = temp.path().join("bare.toml");
+    fs::write(
+        &bare,
+        format!(
+            "[server]\ncontrol_socket = \"{}\"\n",
+            temp.path().join("c2.sock").display()
+        ),
+    )
+    .unwrap();
+    assert!(!Config::load(&bare).unwrap().delivery.enabled);
+}
+
+#[test]
 fn config_rejects_tls_until_native_tls_is_supported() {
     let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join("whdr.toml");

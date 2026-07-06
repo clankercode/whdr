@@ -14,8 +14,8 @@ mod token_control;
 mod token_store;
 
 pub use config::{
-    Config, ExtensionsConfig, LimitsConfig, ServerConfig, SubscribersConfig, TimeoutsConfig,
-    TlsConfig,
+    Config, DeliveryConfig, ExtensionsConfig, LimitsConfig, ServerConfig, SubscribersConfig,
+    TimeoutsConfig, TlsConfig,
 };
 pub use daemon::{AppState, run_until_shutdown, run_with_signals};
 pub use ingest::route_key_from_path;

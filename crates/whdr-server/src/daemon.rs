@@ -1200,7 +1200,10 @@ mod tests {
     use axum::http::header::AUTHORIZATION;
     use futures_util::StreamExt;
 
-    use crate::{ExtensionsConfig, LimitsConfig, ServerConfig, SubscribersConfig, TimeoutsConfig};
+    use crate::{
+        DeliveryConfig, ExtensionsConfig, LimitsConfig, ServerConfig, SubscribersConfig,
+        TimeoutsConfig,
+    };
     use tokio::sync::Barrier;
 
     #[test]
@@ -1242,6 +1245,7 @@ mod tests {
                 drain_ms: 100,
                 term_grace_ms: 50,
             },
+            delivery: DeliveryConfig::default(),
             secrets_file: None,
             secrets: BTreeMap::new(),
         }

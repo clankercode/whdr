@@ -14,6 +14,7 @@ pub struct Config {
     pub extensions: ExtensionsConfig,
     pub limits: LimitsConfig,
     pub timeouts: TimeoutsConfig,
+    pub delivery: DeliveryConfig,
     pub secrets_file: Option<PathBuf>,
     pub secrets: BTreeMap<String, String>,
 }
@@ -131,6 +132,34 @@ impl Default for TimeoutsConfig {
     }
 }
 
+/// Opt-in durable delivery / replay log ([D-store]). Off by default: when
+/// disabled no file is created, no fsync is on the hot path, and replay
+/// requests are refused. Enabling writes payloads to disk, so it is a
+/// deliberate operator choice ([D-dur-optin]).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct DeliveryConfig {
+    pub enabled: bool,
+    pub store_path: PathBuf,
+    pub retention_secs: u64,
+    pub max_bytes: u64,
+    pub max_events: u64,
+    pub prune_interval_secs: u64,
+}
+
+impl Default for DeliveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            store_path: PathBuf::from("/var/lib/whdr/delivery.redb"),
+            retention_secs: 86_400,
+            max_bytes: 536_870_912,
+            max_events: 1_000_000,
+            prune_interval_secs: 300,
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawConfig {
@@ -139,6 +168,7 @@ struct RawConfig {
     extensions: ExtensionsConfig,
     limits: LimitsConfig,
     timeouts: TimeoutsConfig,
+    delivery: DeliveryConfig,
     secrets: Option<SecretsSection>,
 }
 
@@ -170,6 +200,7 @@ impl Config {
             extensions: raw.extensions,
             limits: raw.limits,
             timeouts: raw.timeouts,
+            delivery: raw.delivery,
             secrets_file,
             secrets,
         };
@@ -202,6 +233,13 @@ impl Config {
             bail!(
                 "refusing non-loopback subscriber bind without TLS or allow_plaintext_lan = true"
             );
+        }
+        if self.delivery.enabled
+            && (self.delivery.retention_secs == 0
+                || self.delivery.max_bytes == 0
+                || self.delivery.max_events == 0)
+        {
+            bail!("[delivery] retention_secs/max_bytes/max_events must be > 0 when enabled");
         }
         Ok(())
     }
