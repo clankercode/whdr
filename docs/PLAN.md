@@ -166,4 +166,8 @@ can start after M1; the exts need M2 to test against).
 
 Shipped since v0.1 of this plan: Prometheus `/metrics` (loopback-only, [D-metrics]),
 event `id`/`ts_ms` stamping [D-evid], byte-budgeted drop-oldest subscriber queues
-(revised [D-slow]), and per-ext `events_emitted`/`last_event_at_ms` in status.
+(revised [D-slow]), per-ext `events_emitted`/`last_event_at_ms` in status, and the M1
+misbehavior harness in adapted form: the `whdr-ext-fake` scriptable extension
+(`crates/whdr-server/examples/`) plus `whdr-test-support` drive a whole-system suite
+(`crates/whdr-server/tests/system.rs`) covering the M2–M5 exit criteria against the real
+server binary.
