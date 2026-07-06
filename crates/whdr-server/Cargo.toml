@@ -19,6 +19,7 @@ http.workspace = true
 hyper.workspace = true
 libc.workspace = true
 rand.workspace = true
+redb.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 serde.workspace = true

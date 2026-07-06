@@ -35,6 +35,7 @@ hyper = "1"
 libc = "0.2"
 proptest = "1"
 rand = "0.9"
+redb = "2"
 rustls = "0.23"
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }

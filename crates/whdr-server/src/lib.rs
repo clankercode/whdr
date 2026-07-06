@@ -2,6 +2,7 @@ mod channel_claims;
 mod config;
 mod control_plane;
 mod daemon;
+mod delivery_log;
 mod dispatch_window;
 mod extension_process;
 mod extension_registration;
