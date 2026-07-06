@@ -1722,7 +1722,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "whdr-proto",
- "whdr-server",
 ]
 
 [[package]]
