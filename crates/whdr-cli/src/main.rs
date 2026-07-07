@@ -91,8 +91,30 @@ async fn send_request(path: &PathBuf, request: ControlRequest) -> Result<Control
     Ok(decode_line::<ControlResponse>(&line)?.expect("response line is not blank"))
 }
 
+/// Format a millisecond duration as a compact string using the largest two
+/// non-zero units (d/h/m/s), e.g. `10h 32m`. Below a minute, only seconds are
+/// shown.
+fn humanize_ms(ms: u64) -> String {
+    let total_secs = ms / 1000;
+    let days = total_secs / 86_400;
+    let hours = (total_secs % 86_400) / 3_600;
+    let mins = (total_secs % 3_600) / 60;
+    let secs = total_secs % 60;
+
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {mins}m")
+    } else if mins > 0 {
+        format!("{mins}m {secs}s")
+    } else {
+        format!("{secs}s")
+    }
+}
+
 fn print_status(status: &serde_json::Value) {
-    println!("uptime_ms: {}", status["uptime_ms"]);
+    let uptime_ms = status["uptime_ms"].as_u64().unwrap_or(0);
+    println!("uptime_ms: {uptime_ms} ({})", humanize_ms(uptime_ms));
     println!("extensions:");
     if let Some(exts) = status["extensions"].as_array() {
         for ext in exts {
@@ -117,5 +139,35 @@ fn print_status(status: &serde_json::Value) {
                 sub["dropped"]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::humanize_ms;
+
+    #[test]
+    fn humanize_ms_examples() {
+        assert_eq!(humanize_ms(0), "0s");
+        assert_eq!(humanize_ms(5_000), "5s");
+        assert_eq!(humanize_ms(90_000), "1m 30s");
+        assert_eq!(humanize_ms(37_946_866), "10h 32m");
+        assert_eq!(humanize_ms(172_800_000), "2d 0h");
+    }
+
+    #[test]
+    fn humanize_ms_boundaries() {
+        // Just under a minute stays in seconds.
+        assert_eq!(humanize_ms(59_999), "59s");
+        // Exactly one minute.
+        assert_eq!(humanize_ms(60_000), "1m 0s");
+        // Just under an hour stays in minutes+seconds.
+        assert_eq!(humanize_ms(3_599_000), "59m 59s");
+        // Exactly one hour.
+        assert_eq!(humanize_ms(3_600_000), "1h 0m");
+        // Just under a day stays in hours+minutes.
+        assert_eq!(humanize_ms(86_399_000), "23h 59m");
+        // Exactly one day.
+        assert_eq!(humanize_ms(86_400_000), "1d 0h");
     }
 }
